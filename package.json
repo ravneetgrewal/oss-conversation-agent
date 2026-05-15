@@ -1,0 +1,13 @@
+{
+  "name": "oss-conversation-agent",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node src/server/index.js",
+    "check": "node --check src/server/index.js && node --check src/server/store.js && node --check src/server/openai.js && node --check src/server/providers.js && node --check src/server/uploads.js && node --check src/server/memory.js && node --check src/server/env.js && node --check src/server/attachments.js"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
