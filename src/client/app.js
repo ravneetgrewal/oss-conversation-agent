@@ -8,7 +8,10 @@ const state = {
   defaultModel: "",
   pendingFiles: [],
   abortController: null,
-  isStreaming: false
+  isStreaming: false,
+  compareMode: false,
+  compareModel: "",
+  activeStream: null
 };
 
 const els = {
@@ -23,6 +26,12 @@ const els = {
   modelPickerButton: document.querySelector("#model-picker-button"),
   modelPickerLabel: document.querySelector("#model-picker-label"),
   modelPickerMenu: document.querySelector("#model-picker-menu"),
+  compareToggle: document.querySelector("#compare-toggle"),
+  compareModel: document.querySelector("#compare-model-select"),
+  compareModelPicker: document.querySelector("#compare-model-picker"),
+  compareModelPickerButton: document.querySelector("#compare-model-picker-button"),
+  compareModelPickerLabel: document.querySelector("#compare-model-picker-label"),
+  compareModelPickerMenu: document.querySelector("#compare-model-picker-menu"),
   memoryToggle: document.querySelector("#memory-toggle"),
   memoryPanel: document.querySelector("#memory-panel"),
   memoryClose: document.querySelector("#memory-close"),
@@ -47,6 +56,7 @@ const els = {
 await bootstrap();
 bindEvents();
 closeModelPicker();
+closeCompareModelPicker();
 
 async function bootstrap() {
   const data = await api("/api/bootstrap");
@@ -72,6 +82,9 @@ function bindEvents() {
   els.search.addEventListener("input", renderConversations);
   els.model.addEventListener("change", updateModel);
   els.modelPickerButton.addEventListener("click", toggleModelPicker);
+  els.compareToggle.addEventListener("click", toggleCompareMode);
+  els.compareModel.addEventListener("change", updateCompareModel);
+  els.compareModelPickerButton.addEventListener("click", toggleCompareModelPicker);
   document.addEventListener("click", closeModelPickerOnOutsideClick);
   document.addEventListener("keydown", closeModelPickerOnEscape);
   els.memoryToggle.addEventListener("click", openMemoryPanel);
@@ -114,6 +127,9 @@ async function loadConversation(id) {
   els.title.value = data.conversation.title;
   els.title.disabled = false;
   setModelValue(normalizeModelValue(data.conversation.model || state.defaultModel));
+  if (!state.compareModel || state.compareModel === els.model.value) {
+    setCompareModelValue(getFallbackCompareModel(els.model.value));
+  }
   renderConversations();
   renderMessages();
   renderMemoryPanel();
@@ -125,11 +141,16 @@ async function updateModel() {
   if (!state.activeConversation) return;
   state.activeConversation.model = els.model.value;
   syncModelPicker();
+  if (els.compareModel.value === els.model.value) setCompareModelValue(getFallbackCompareModel(els.model.value));
   await api(`/api/conversations/${state.activeConversation.id}`, {
     method: "PATCH",
     body: { model: els.model.value }
   });
   renderConversations();
+}
+
+function updateCompareModel() {
+  setCompareModelValue(els.compareModel.value);
 }
 
 async function updateTitle() {
@@ -162,6 +183,8 @@ async function sendMessage(event) {
   const content = els.input.value.trim();
   const fileIds = state.pendingFiles.map((file) => file.id);
   if (!content && fileIds.length === 0) return;
+  const selectedModels = getSelectedModels();
+  const turnId = `local-turn-${Date.now()}`;
 
   const userMessage = {
     id: `local-user-${Date.now()}`,
@@ -169,19 +192,23 @@ async function sendMessage(event) {
     content,
     files: fileIds,
     status: "completed",
+    turnId,
     createdAt: new Date().toISOString()
   };
-  const assistantMessage = {
-    id: `local-assistant-${Date.now()}`,
+  const assistantMessages = selectedModels.map((model, index) => ({
+    id: `local-assistant-${Date.now()}-${index}`,
     role: "assistant",
     content: "",
     error: null,
     files: [],
+    model,
     status: "streaming",
+    turnId,
+    candidateIndex: index,
     createdAt: new Date().toISOString()
-  };
+  }));
 
-  state.messages.push(userMessage, assistantMessage);
+  state.messages.push(userMessage, ...assistantMessages);
   els.input.value = "";
   state.pendingFiles = [];
   autoresize();
@@ -190,18 +217,32 @@ async function sendMessage(event) {
   setStreaming(true);
 
   state.abortController = new AbortController();
+  state.activeStream = {
+    expectedAssistantCount: selectedModels.length,
+    compareUnsupported: false
+  };
   try {
     await consumeSse(`/api/conversations/${state.activeConversation.id}/messages`, {
       content,
       model: els.model.value,
+      models: selectedModels,
       fileIds
     }, state.abortController.signal);
-    await refreshActiveConversation();
+    if (!state.activeStream?.compareUnsupported) {
+      await refreshActiveConversation();
+    } else {
+      renderMessages(false);
+    }
   } catch (error) {
-    assistantMessage.status = "failed";
-    assistantMessage.content ||= error.message;
+    for (const assistantMessage of assistantMessages) {
+      if (assistantMessage.status === "streaming") {
+        assistantMessage.status = "failed";
+        assistantMessage.content ||= error.message;
+      }
+    }
     renderMessages();
   } finally {
+    state.activeStream = null;
     setStreaming(false);
   }
 }
@@ -210,34 +251,55 @@ async function regenerateLast() {
   if (state.isStreaming || !state.activeConversation) return;
   const lastUserIndex = findLastIndex(state.messages, (message) => message.role === "user");
   if (lastUserIndex === -1) return;
+  const previousCandidates = state.messages.slice(lastUserIndex + 1).filter((message) => message.role === "assistant");
+  const selectedModels = state.compareMode
+    ? getSelectedModels()
+    : previousCandidates.length > 1
+      ? uniqueModels(previousCandidates.map((message) => message.model)).slice(0, 2)
+      : [els.model.value];
+  const turnId = state.messages[lastUserIndex].turnId || `local-turn-${Date.now()}`;
 
   state.messages = state.messages.slice(0, lastUserIndex + 1);
-  state.messages.push({
-    id: `local-assistant-${Date.now()}`,
+  state.messages.push(...selectedModels.map((model, index) => ({
+    id: `local-assistant-${Date.now()}-${index}`,
     role: "assistant",
     content: "",
     error: null,
     files: [],
+    model,
     status: "streaming",
+    turnId,
+    candidateIndex: index,
     createdAt: new Date().toISOString()
-  });
+  })));
   renderMessages();
   setStreaming(true);
 
   state.abortController = new AbortController();
+  state.activeStream = {
+    expectedAssistantCount: selectedModels.length,
+    compareUnsupported: false
+  };
   try {
     await consumeSse(`/api/conversations/${state.activeConversation.id}/regenerate`, {
-      model: els.model.value
+      model: els.model.value,
+      models: selectedModels
     }, state.abortController.signal);
-    await refreshActiveConversation();
+    if (!state.activeStream?.compareUnsupported) {
+      await refreshActiveConversation();
+    } else {
+      renderMessages(false);
+    }
   } catch (error) {
-    const last = state.messages[state.messages.length - 1];
-    if (last?.role === "assistant") {
-      last.status = "failed";
-      last.content ||= error.message;
+    for (const message of state.messages.slice(lastUserIndex + 1)) {
+      if (message.role === "assistant" && message.status === "streaming") {
+        message.status = "failed";
+        message.content ||= error.message;
+      }
     }
     renderMessages();
   } finally {
+    state.activeStream = null;
     setStreaming(false);
   }
 }
@@ -271,9 +333,30 @@ function handleSseEvent(raw) {
   const data = dataLine ? JSON.parse(dataLine.slice(5)) : {};
 
   if (event === "message.started") {
-    const lastTwo = state.messages.slice(-2);
-    if (data.userMessage && lastTwo[0]?.id?.startsWith("local-user")) lastTwo[0].id = data.userMessage.id;
-    if (lastTwo[1]?.id?.startsWith("local-assistant")) lastTwo[1].id = data.assistantMessage.id;
+    const localUser = [...state.messages].reverse().find((message) => message.id?.startsWith("local-user"));
+    if (data.userMessage && localUser) {
+      localUser.id = data.userMessage.id;
+      localUser.turnId = data.userMessage.turnId;
+    }
+    const serverAssistants = data.assistantMessages || (data.assistantMessage ? [data.assistantMessage] : []);
+    const expectedAssistantCount = state.activeStream?.expectedAssistantCount || serverAssistants.length || 1;
+    const localAssistants = state.messages.filter((message) => message.id?.startsWith("local-assistant")).slice(-expectedAssistantCount);
+    serverAssistants.forEach((assistant, index) => {
+      if (!localAssistants[index]) return;
+      localAssistants[index].id = assistant.id;
+      localAssistants[index].turnId = assistant.turnId;
+      localAssistants[index].candidateIndex = assistant.candidateIndex;
+      localAssistants[index].model = assistant.model;
+    });
+    if (expectedAssistantCount > 1 && serverAssistants.length < expectedAssistantCount) {
+      state.activeStream.compareUnsupported = true;
+      for (const assistant of localAssistants.slice(serverAssistants.length)) {
+        assistant.status = "failed";
+        assistant.error = "Compare mode needs the updated backend. Restart the server on port 4613, then send again.";
+        assistant.content = assistant.error;
+      }
+      els.connection.textContent = "Restart server to enable Compare";
+    }
   }
 
   if (event === "message.delta") {
@@ -375,20 +458,35 @@ function renderModels() {
   els.model.innerHTML = state.models.map((model) => {
     return `<option value="${escapeHtml(model.key)}">${escapeHtml(model.label)}</option>`;
   }).join("");
-  els.modelPickerMenu.innerHTML = state.models.map((model) => `
+  els.compareModel.innerHTML = els.model.innerHTML;
+  els.modelPickerMenu.innerHTML = renderModelOptions();
+  els.compareModelPickerMenu.innerHTML = renderModelOptions();
+  bindModelOptionClicks(els.modelPickerMenu, (value) => {
+    setModelValue(value);
+    closeModelPicker();
+    updateModel();
+  });
+  bindModelOptionClicks(els.compareModelPickerMenu, (value) => {
+    setCompareModelValue(value);
+    closeCompareModelPicker();
+  });
+  setModelValue(state.defaultModel);
+  setCompareModelValue(getFallbackCompareModel(state.defaultModel));
+}
+
+function renderModelOptions() {
+  return state.models.map((model) => `
     <button class="model-option" type="button" role="option" data-value="${escapeHtml(model.key)}">
       <span>${escapeHtml(compactModelLabel(model))}</span>
       <small>${escapeHtml(model.provider)}</small>
     </button>
   `).join("");
-  els.modelPickerMenu.querySelectorAll(".model-option").forEach((button) => {
-    button.addEventListener("click", () => {
-      setModelValue(button.dataset.value);
-      closeModelPicker();
-      updateModel();
-    });
+}
+
+function bindModelOptionClicks(menu, onSelect) {
+  menu.querySelectorAll(".model-option").forEach((button) => {
+    button.addEventListener("click", () => onSelect(button.dataset.value));
   });
-  setModelValue(state.defaultModel);
 }
 
 function renderConversationsLegacy() {
@@ -427,19 +525,75 @@ function renderMessages(scroll = true) {
     return;
   }
 
-  els.messages.innerHTML = state.messages.map((message) => `
+  els.messages.innerHTML = groupMessagesForRender(state.messages).map((item) => {
+    if (item.type === "compare") return renderCompareGroup(item.messages);
+    return renderSingleMessage(item.message);
+  }).join("");
+
+  if (scroll) els.messages.scrollTop = els.messages.scrollHeight;
+  updateActionState();
+}
+
+function groupMessagesForRender(messages) {
+  const groups = [];
+  for (let index = 0; index < messages.length; index += 1) {
+    const message = messages[index];
+    if (message.role !== "assistant" || !message.turnId) {
+      groups.push({ type: "single", message });
+      continue;
+    }
+    const candidates = [message];
+    while (
+      index + 1 < messages.length &&
+      messages[index + 1].role === "assistant" &&
+      messages[index + 1].turnId === message.turnId
+    ) {
+      candidates.push(messages[index + 1]);
+      index += 1;
+    }
+    if (candidates.length > 1) {
+      groups.push({ type: "compare", messages: candidates });
+    } else {
+      groups.push({ type: "single", message });
+    }
+  }
+  return groups;
+}
+
+function renderSingleMessage(message) {
+  return `
     <article class="message ${escapeHtml(message.role)}">
       <div class="message-role">${escapeHtml(message.role)}</div>
       <div class="message-body">
         ${renderMarkdown(message.content || statusText(message))}
+        ${renderMessageFailure(message)}
         ${message.files?.length ? `<div class="message-files">${message.files.map(renderFileTile).join("")}</div>` : ""}
         ${renderMessageActions(message)}
       </div>
     </article>
-  `).join("");
+  `;
+}
 
-  if (scroll) els.messages.scrollTop = els.messages.scrollHeight;
-  updateActionState();
+function renderCompareGroup(messages) {
+  const sorted = [...messages].sort((a, b) => Number(a.candidateIndex || 0) - Number(b.candidateIndex || 0));
+  return `
+    <article class="compare-group" aria-label="Compared model responses">
+      ${sorted.map((message) => `
+        <section class="compare-pane ${escapeHtml(message.status || "")}">
+          <div class="compare-pane-header">
+            <span>${escapeHtml(getModelLabel(message.model))}</span>
+            ${message.status === "streaming" ? "<small>Streaming</small>" : ""}
+            ${message.status === "failed" ? `<small>${message.content?.trim() ? "Stopped early" : "Failed"}</small>` : ""}
+          </div>
+          <div class="message-body">
+            ${renderMarkdown(message.content || statusText(message))}
+            ${renderMessageFailure(message)}
+            ${renderMessageActions(message)}
+          </div>
+        </section>
+      `).join("")}
+    </article>
+  `;
 }
 
 function renderAttachments() {
@@ -470,6 +624,11 @@ function renderMessageActions(message) {
       </button>
     </div>
   `;
+}
+
+function renderMessageFailure(message) {
+  if (message.status !== "failed" || !message.error) return "";
+  return `<div class="message-failure">${escapeHtml(message.error)}</div>`;
 }
 
 async function handleMessageActionClick(event) {
@@ -525,6 +684,8 @@ function setStreaming(value) {
   els.input.disabled = value;
   els.attach.disabled = value;
   els.model.disabled = value;
+  els.compareToggle.disabled = value;
+  els.compareModel.disabled = value;
   updateActionState();
   els.connection.textContent = value ? "Streaming" : "Ready";
 }
@@ -532,6 +693,7 @@ function setStreaming(value) {
 function updateActionState() {
   els.regenerate.disabled = state.isStreaming || !state.messages.some((message) => message.role === "user");
   els.modelPickerButton.disabled = state.isStreaming;
+  els.compareModelPickerButton.disabled = state.isStreaming;
   document.querySelector(".chat-shell")?.classList.toggle("empty", state.messages.length === 0);
 }
 
@@ -879,6 +1041,46 @@ function syncModelPicker() {
   });
 }
 
+function setCompareModelValue(value) {
+  const normalized = normalizeModelValue(value);
+  state.compareModel = normalized === els.model.value ? getFallbackCompareModel(els.model.value) : normalized;
+  els.compareModel.value = state.compareModel;
+  syncCompareModelPicker();
+}
+
+function syncCompareModelPicker() {
+  const selected = state.models.find((model) => model.key === els.compareModel.value) ||
+    state.models.find((model) => model.id === els.compareModel.value);
+  els.compareModelPickerLabel.textContent = selected ? compactModelLabel(selected) : "Compare";
+  els.compareModelPickerMenu.querySelectorAll(".model-option").forEach((option) => {
+    option.classList.toggle("active", option.dataset.value === els.compareModel.value);
+    option.setAttribute("aria-selected", option.dataset.value === els.compareModel.value ? "true" : "false");
+  });
+}
+
+function getFallbackCompareModel(primaryModel) {
+  return state.models.find((model) => model.key !== primaryModel)?.key || primaryModel || state.defaultModel;
+}
+
+function getSelectedModels() {
+  const models = state.compareMode ? [els.model.value, els.compareModel.value] : [els.model.value];
+  return uniqueModels(models.map(normalizeModelValue)).slice(0, 2);
+}
+
+function uniqueModels(models) {
+  return [...new Set(models.filter(Boolean))];
+}
+
+function toggleCompareMode() {
+  if (state.isStreaming) return;
+  state.compareMode = !state.compareMode;
+  els.compareToggle.setAttribute("aria-pressed", state.compareMode ? "true" : "false");
+  els.compareToggle.classList.toggle("active", state.compareMode);
+  els.compareModelPicker.hidden = !state.compareMode;
+  closeModelPicker();
+  closeCompareModelPicker();
+}
+
 function toggleModelPicker(event) {
   event.stopPropagation();
   if (state.isStreaming) return;
@@ -892,12 +1094,30 @@ function closeModelPicker() {
   els.modelPickerButton.setAttribute("aria-expanded", "false");
 }
 
+function toggleCompareModelPicker(event) {
+  event.stopPropagation();
+  if (state.isStreaming) return;
+  const willOpen = els.compareModelPickerMenu.hidden;
+  closeModelPicker();
+  els.compareModelPickerMenu.hidden = !willOpen;
+  els.compareModelPickerButton.setAttribute("aria-expanded", willOpen ? "true" : "false");
+}
+
+function closeCompareModelPicker() {
+  els.compareModelPickerMenu.hidden = true;
+  els.compareModelPickerButton.setAttribute("aria-expanded", "false");
+}
+
 function closeModelPickerOnOutsideClick(event) {
   if (!els.modelPicker.contains(event.target)) closeModelPicker();
+  if (!els.compareModelPicker.contains(event.target)) closeCompareModelPicker();
 }
 
 function closeModelPickerOnEscape(event) {
-  if (event.key === "Escape") closeModelPicker();
+  if (event.key === "Escape") {
+    closeModelPicker();
+    closeCompareModelPicker();
+  }
 }
 
 function renderConversations() {

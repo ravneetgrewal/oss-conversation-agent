@@ -88,7 +88,16 @@ export async function listMessages(conversationId) {
     .sort((a, b) => a.createdAt.localeCompare(b.createdAt));
 }
 
-export async function addMessage({ conversationId, role, content = "", model = null, status = "completed", files = [] }) {
+export async function addMessage({
+  conversationId,
+  role,
+  content = "",
+  model = null,
+  status = "completed",
+  files = [],
+  turnId = null,
+  candidateIndex = null
+}) {
   await loadStore();
   const now = new Date().toISOString();
   const message = {
@@ -99,6 +108,8 @@ export async function addMessage({ conversationId, role, content = "", model = n
     model,
     status,
     files,
+    turnId,
+    candidateIndex,
     providerResponseId: null,
     usage: null,
     error: null,

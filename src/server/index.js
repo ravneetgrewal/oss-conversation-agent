@@ -1,6 +1,7 @@
 import http from "node:http";
 import { readFile } from "node:fs/promises";
 import path from "node:path";
+import { randomUUID } from "node:crypto";
 import { loadEnvFile } from "./env.js";
 import { addMessage, createConversation, deleteMessagesAfter, getConversation, getFile, getFiles, getMemory, listConversations, listMessages, updateConversation, updateMessage, upsertMemory } from "./store.js";
 import { getDefaultModel, models, resolveModel, streamAssistantResponse } from "./providers.js";
@@ -159,7 +160,8 @@ async function streamConversationMessage(req, res, conversationId) {
 
   const body = await readJson(req);
   const content = String(body.content || "").trim();
-  const model = resolveModel(body.model || conversation.model || getDefaultModel())?.key || getDefaultModel();
+  const selectedModels = resolveRequestedModels(body, conversation);
+  const model = selectedModels[0];
   const fileIds = Array.isArray(body.fileIds) ? body.fileIds : [];
   if (!content && fileIds.length === 0) return sendJson(res, 400, { error: "Message content or file is required" });
 
@@ -174,10 +176,11 @@ async function streamConversationMessage(req, res, conversationId) {
     role: "user",
     content,
     model,
-    files: files.map((file) => file.id)
+    files: files.map((file) => file.id),
+    turnId: randomUUID()
   });
   const history = await listMessages(conversationId);
-  await streamAssistantForHistory({ req, res, conversationId, model, files, history, userMessage });
+  await streamAssistantsForHistory({ req, res, conversationId, models: selectedModels, files, history, userMessage });
 }
 
 async function regenerateConversationMessage(req, res, conversationId) {
@@ -185,30 +188,39 @@ async function regenerateConversationMessage(req, res, conversationId) {
   if (!conversation) return sendJson(res, 404, { error: "Conversation not found" });
 
   const body = await readJson(req);
-  const model = resolveModel(body.model || conversation.model || getDefaultModel())?.key || getDefaultModel();
   const messages = await listMessages(conversationId);
-  const lastUser = [...messages].reverse().find((message) => message.role === "user");
+  const lastUserIndex = findLastIndex(messages, (message) => message.role === "user");
+  const lastUser = lastUserIndex === -1 ? null : messages[lastUserIndex];
   if (!lastUser) return sendJson(res, 400, { error: "No user message to regenerate from" });
+  const trailingAssistants = messages.slice(lastUserIndex + 1).filter((message) => message.role === "assistant");
+  const selectedModels = resolveRequestedModels(body, conversation, trailingAssistants.map((message) => message.model).filter(Boolean));
+  const model = selectedModels[0];
 
   await deleteMessagesAfter(conversationId, lastUser.id);
   await updateConversation(conversationId, { model });
   const files = await getFiles(lastUser.files || []);
   const history = await listMessages(conversationId);
-  await streamAssistantForHistory({ req, res, conversationId, model, files, history, userMessage: null });
+  await streamAssistantsForHistory({ req, res, conversationId, models: selectedModels, files, history, userMessage: null });
 }
 
-async function streamAssistantForHistory({ req, res, conversationId, model, files, history, userMessage }) {
+async function streamAssistantsForHistory({ req, res, conversationId, models, files, history, userMessage }) {
   const memory = await getConversationMemory(conversationId);
   const modelMessages = prepareMessagesForModel(history, memory);
-  const assistantMessage = await addMessage({
-    conversationId,
-    role: "assistant",
-    content: "",
-    model,
-    status: "streaming"
-  });
+  const lastHistoryUserIndex = findLastIndex(history, (message) => message.role === "user");
+  const turnId = userMessage?.turnId || history[lastHistoryUserIndex]?.turnId || randomUUID();
+  const assistantMessages = [];
+  for (const [index, model] of models.entries()) {
+    assistantMessages.push(await addMessage({
+      conversationId,
+      role: "assistant",
+      content: "",
+      model,
+      status: "streaming",
+      turnId,
+      candidateIndex: index
+    }));
+  }
   const abortController = new AbortController();
-  let accumulated = "";
 
   req.on("close", () => abortController.abort());
 
@@ -219,36 +231,69 @@ async function streamAssistantForHistory({ req, res, conversationId, model, file
     "X-Accel-Buffering": "no"
   });
 
-  writeEvent(res, "message.started", { userMessage, assistantMessage });
+  writeEvent(res, "message.started", { userMessage, assistantMessages });
+
+  const streamOne = async (assistantMessage) => {
+    let accumulated = "";
+    try {
+      for await (const event of streamAssistantResponse({ model: assistantMessage.model, messages: modelMessages, files, memory, signal: abortController.signal })) {
+        if (event.type === "message.delta") {
+          accumulated += event.delta;
+          writeEvent(res, event.type, { messageId: assistantMessage.id, delta: event.delta });
+        } else if (event.type === "message.completed") {
+          await updateMessage(assistantMessage.id, {
+            content: accumulated,
+            status: "completed",
+            providerResponseId: event.providerResponseId,
+            usage: event.usage
+          });
+          writeEvent(res, event.type, { messageId: assistantMessage.id, providerResponseId: event.providerResponseId, usage: event.usage });
+        }
+      }
+    } catch (error) {
+      const status = abortController.signal.aborted ? "cancelled" : "failed";
+      await updateMessage(assistantMessage.id, {
+        content: accumulated,
+        status,
+        error: error.message
+      });
+      writeEvent(res, "message.failed", { messageId: assistantMessage.id, status, error: error.message });
+    }
+  };
 
   try {
-    for await (const event of streamAssistantResponse({ model, messages: modelMessages, files, memory, signal: abortController.signal })) {
-      if (event.type === "message.delta") {
-        accumulated += event.delta;
-        writeEvent(res, event.type, { messageId: assistantMessage.id, delta: event.delta });
-      } else if (event.type === "message.completed") {
-        await updateMessage(assistantMessage.id, {
-          content: accumulated,
-          status: "completed",
-          providerResponseId: event.providerResponseId,
-          usage: event.usage
-        });
-        writeEvent(res, event.type, { messageId: assistantMessage.id, providerResponseId: event.providerResponseId, usage: event.usage });
-        const updatedMemory = await refreshConversationMemory(conversationId, memory);
-        if (updatedMemory) writeEvent(res, "memory.updated", { memory: updatedMemory });
-      }
-    }
-  } catch (error) {
-    const status = abortController.signal.aborted ? "cancelled" : "failed";
-    await updateMessage(assistantMessage.id, {
-      content: accumulated,
-      status,
-      error: error.message
-    });
-    writeEvent(res, "message.failed", { messageId: assistantMessage.id, status, error: error.message });
+    await Promise.all(assistantMessages.map(streamOne));
+    const updatedMemory = await refreshConversationMemory(conversationId, memory);
+    if (updatedMemory) writeEvent(res, "memory.updated", { memory: updatedMemory });
   } finally {
     res.end();
   }
+}
+
+function findLastIndex(items, predicate) {
+  for (let index = items.length - 1; index >= 0; index -= 1) {
+    if (predicate(items[index], index)) return index;
+  }
+  return -1;
+}
+
+function resolveRequestedModels(body, conversation, fallbackModels = []) {
+  const requested = Array.isArray(body.models) && body.models.length
+    ? body.models
+    : [
+        ...fallbackModels,
+        body.model,
+        conversation.model,
+        getDefaultModel()
+      ];
+  const selected = [];
+  for (const value of requested) {
+    const model = resolveModel(value)?.key;
+    if (!model || selected.includes(model)) continue;
+    selected.push(model);
+    if (selected.length === 2) break;
+  }
+  return selected.length ? selected : [getDefaultModel()];
 }
 
 async function getConversationMemory(conversationId) {

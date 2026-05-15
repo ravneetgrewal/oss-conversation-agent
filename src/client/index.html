@@ -4,7 +4,7 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>Conversation Agent</title>
-    <link rel="stylesheet" href="/styles.css?v=20260515-ui2">
+    <link rel="stylesheet" href="/styles.css?v=20260515-compare1">
   </head>
   <body>
     <div class="app-shell">
@@ -89,6 +89,7 @@
             <button id="attach-button" class="round-button composer-icon" type="button" title="Attach file" aria-label="Attach file">+</button>
             <input id="file-input" type="file" multiple hidden>
             <textarea id="message-input" rows="1" placeholder="Ask anything" autocomplete="off"></textarea>
+            <button id="compare-toggle" class="compare-toggle" type="button" aria-pressed="false">Compare</button>
             <div class="model-picker" id="model-picker">
               <button id="model-picker-button" class="model-picker-button" type="button" aria-haspopup="listbox" aria-expanded="false">
                 <span id="model-picker-label">Model</span>
@@ -96,6 +97,14 @@
               </button>
               <div id="model-picker-menu" class="model-picker-menu" role="listbox" hidden></div>
               <select id="model-select" aria-label="Model"></select>
+            </div>
+            <div class="model-picker compare-model-picker" id="compare-model-picker" hidden>
+              <button id="compare-model-picker-button" class="model-picker-button" type="button" aria-haspopup="listbox" aria-expanded="false">
+                <span id="compare-model-picker-label">Model</span>
+                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg>
+              </button>
+              <div id="compare-model-picker-menu" class="model-picker-menu" role="listbox" hidden></div>
+              <select id="compare-model-select" aria-label="Compare model"></select>
             </div>
             <button id="stop-button" class="ghost-button" type="button" hidden>Stop</button>
             <button id="send-button" class="voice-send-button" type="submit" title="Send" aria-label="Send">
@@ -105,6 +114,6 @@
         </form>
       </main>
     </div>
-    <script type="module" src="/app.js?v=20260515-ui2"></script>
+    <script type="module" src="/app.js?v=20260515-compare1"></script>
   </body>
 </html>

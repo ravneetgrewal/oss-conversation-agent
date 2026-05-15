@@ -188,6 +188,10 @@ function formatOpenRouterError({ status, body, error, modelLabel }) {
     return `${prefix} OpenRouter reported a quota or rate-limit problem. Provider error: ${providerMessage}`;
   }
 
+  if (status >= 500 || lower.includes("internal server error") || lower.includes("server error")) {
+    return `${prefix} The upstream model provider failed after accepting the request. This is usually transient or model-specific; retry this pane or choose another model. Provider error: ${providerMessage}`;
+  }
+
   if (status) {
     return `${prefix} OpenRouter returned HTTP ${status}. Provider error: ${providerMessage}`;
   }
