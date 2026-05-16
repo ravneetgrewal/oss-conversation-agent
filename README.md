@@ -16,29 +16,27 @@ Compare mode lets one prompt run against two selected models at the same time. E
 
 - Streaming assistant responses over server-sent events.
 - Two-model Compare mode with parallel streaming response panes.
-- Provider registry with OpenAI and OpenRouter models.
+- Provider registry with dynamically refreshed OpenAI and OpenRouter model catalogs.
 - Per-chat memory manager with inspectable and editable memory.
 - File uploads with named attachment tiles and file-open links.
 - OpenAI multimodal/file input support for images, PDFs, docs, text, code, CSV, and common office formats.
 - OpenRouter image/text compatibility where supported by the selected model.
 - Markdown rendering for headings, lists, links, code blocks, blockquotes, and tables.
 - Response controls for copy, markdown download, and regenerate.
+- Per-response input/output token usage when the provider returns usage data.
 - Per-pane failure handling for provider errors during Compare mode.
 - Dependency-free Node server and browser client.
 - Local JSON persistence for conversations, messages, files, and memory.
 
 ## Run Locally
 
-Create or edit `.env`:
+Create a local env file:
 
-```env
-APP_PORT=4613
-DEFAULT_MODEL=openai:gpt-5.4
-DEFAULT_SYSTEM_PROMPT=You are a concise, useful conversational agent.
-APP_PUBLIC_URL=http://127.0.0.1:4613
-OPENAI_API_KEY=
-OPENROUTER_API_KEY=
+```powershell
+Copy-Item .env.example .env
 ```
+
+Add your `OPENAI_API_KEY` and/or `OPENROUTER_API_KEY` to `.env`.
 
 Start the app:
 
@@ -53,6 +51,28 @@ http://127.0.0.1:4613
 ```
 
 If provider keys are not set, the app runs in demo streaming mode so the interface and persistence can still be tested.
+
+## Run With Docker
+
+Create `.env` from the example file and add any provider keys:
+
+```powershell
+Copy-Item .env.example .env
+```
+
+Build and start:
+
+```powershell
+docker compose up --build
+```
+
+Open:
+
+```text
+http://127.0.0.1:4613
+```
+
+Compose mounts `./data` and `./uploads` into the container so conversations and uploaded files persist across restarts.
 
 ## Provider Notes
 

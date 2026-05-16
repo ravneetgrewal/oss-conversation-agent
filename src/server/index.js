@@ -4,13 +4,14 @@ import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { loadEnvFile } from "./env.js";
 import { addMessage, createConversation, deleteMessagesAfter, getConversation, getFile, getFiles, getMemory, listConversations, listMessages, updateConversation, updateMessage, upsertMemory } from "./store.js";
-import { getDefaultModel, models, resolveModel, streamAssistantResponse } from "./providers.js";
+import { getDefaultModel, getModelCatalog, refreshModelCatalog, resolveModel, streamAssistantResponse } from "./providers.js";
 import { saveUploadedFile } from "./uploads.js";
 import { buildMemorySnapshot, createEmptyMemory, prepareMessagesForModel, shouldUpdateMemory } from "./memory.js";
 
 await loadEnvFile();
 
 const PORT = Number(process.env.APP_PORT || 4499);
+const HOST = process.env.APP_HOST || "127.0.0.1";
 const PUBLIC_DIR = path.resolve("src/client");
 
 const server = http.createServer(async (req, res) => {
@@ -29,20 +30,41 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
-server.listen(PORT, "127.0.0.1", () => {
-  console.log(`Conversation Agent running at http://127.0.0.1:${PORT}`);
+server.listen(PORT, HOST, () => {
+  const displayHost = HOST === "0.0.0.0" ? "127.0.0.1" : HOST;
+  console.log(`Conversation Agent running at http://${displayHost}:${PORT}`);
 });
 
 async function handleApi(req, res) {
   const url = new URL(req.url, `http://${req.headers.host}`);
 
   if (req.method === "GET" && url.pathname === "/api/bootstrap") {
+    const catalog = await getModelCatalog();
     sendJson(res, 200, {
       defaultModel: getDefaultModel(),
-      models,
+      models: catalog.models,
+      modelCatalog: {
+        fetchedAt: catalog.fetchedAt,
+        source: catalog.source,
+        errors: catalog.errors
+      },
       hasOpenAiKey: Boolean(process.env.OPENAI_API_KEY),
       hasOpenRouterKey: Boolean(process.env.OPENROUTER_API_KEY),
       conversations: await listConversations()
+    });
+    return;
+  }
+
+  if (req.method === "POST" && url.pathname === "/api/models/refresh") {
+    const catalog = await refreshModelCatalog();
+    sendJson(res, 200, {
+      defaultModel: getDefaultModel(),
+      models: catalog.models,
+      modelCatalog: {
+        fetchedAt: catalog.fetchedAt,
+        source: catalog.source,
+        errors: catalog.errors
+      }
     });
     return;
   }

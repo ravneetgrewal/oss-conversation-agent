@@ -5,6 +5,7 @@ const state = {
   filesById: new Map(),
   memory: null,
   models: [],
+  modelCatalog: null,
   defaultModel: "",
   pendingFiles: [],
   abortController: null,
@@ -26,6 +27,7 @@ const els = {
   modelPickerButton: document.querySelector("#model-picker-button"),
   modelPickerLabel: document.querySelector("#model-picker-label"),
   modelPickerMenu: document.querySelector("#model-picker-menu"),
+  refreshModels: document.querySelector("#refresh-models"),
   compareToggle: document.querySelector("#compare-toggle"),
   compareModel: document.querySelector("#compare-model-select"),
   compareModelPicker: document.querySelector("#compare-model-picker"),
@@ -62,6 +64,7 @@ async function bootstrap() {
   const data = await api("/api/bootstrap");
   state.conversations = data.conversations;
   state.models = data.models;
+  state.modelCatalog = data.modelCatalog || null;
   state.defaultModel = data.defaultModel;
   els.connection.textContent = [
     data.hasOpenAiKey ? "OpenAI" : "",
@@ -80,6 +83,7 @@ async function bootstrap() {
 function bindEvents() {
   els.newChat.addEventListener("click", () => createConversation());
   els.search.addEventListener("input", renderConversations);
+  els.refreshModels.addEventListener("click", refreshModels);
   els.model.addEventListener("change", updateModel);
   els.modelPickerButton.addEventListener("click", toggleModelPicker);
   els.compareToggle.addEventListener("click", toggleCompareMode);
@@ -151,6 +155,32 @@ async function updateModel() {
 
 function updateCompareModel() {
   setCompareModelValue(els.compareModel.value);
+}
+
+async function refreshModels() {
+  if (state.isStreaming) return;
+  const currentModel = els.model.value;
+  const currentCompareModel = els.compareModel.value;
+  els.refreshModels.disabled = true;
+  els.refreshModels.classList.add("spinning");
+  els.connection.textContent = "Refreshing models";
+  try {
+    const data = await api("/api/models/refresh", { method: "POST" });
+    state.models = data.models;
+    state.modelCatalog = data.modelCatalog || null;
+    state.defaultModel = data.defaultModel;
+    renderModels({
+      primary: normalizeModelValue(currentModel),
+      compare: normalizeModelValue(currentCompareModel)
+    });
+    const errors = state.modelCatalog?.errors || [];
+    els.connection.textContent = errors.length ? `Models refreshed with ${errors.length} warning${errors.length === 1 ? "" : "s"}` : "Models refreshed";
+  } catch (error) {
+    els.connection.textContent = "Model refresh failed";
+  } finally {
+    els.refreshModels.disabled = false;
+    els.refreshModels.classList.remove("spinning");
+  }
 }
 
 async function updateTitle() {
@@ -367,7 +397,11 @@ function handleSseEvent(raw) {
 
   if (event === "message.completed") {
     const message = state.messages.find((item) => item.id === data.messageId);
-    if (message) message.status = "completed";
+    if (message) {
+      message.status = "completed";
+      message.providerResponseId = data.providerResponseId;
+      message.usage = data.usage;
+    }
   }
 
   if (event === "message.failed") {
@@ -454,10 +488,8 @@ async function uploadFiles() {
   renderAttachments();
 }
 
-function renderModels() {
-  els.model.innerHTML = state.models.map((model) => {
-    return `<option value="${escapeHtml(model.key)}">${escapeHtml(model.label)}</option>`;
-  }).join("");
+function renderModels(selection = {}) {
+  els.model.innerHTML = renderNativeModelOptions();
   els.compareModel.innerHTML = els.model.innerHTML;
   els.modelPickerMenu.innerHTML = renderModelOptions();
   els.compareModelPickerMenu.innerHTML = renderModelOptions();
@@ -470,17 +502,120 @@ function renderModels() {
     setCompareModelValue(value);
     closeCompareModelPicker();
   });
-  setModelValue(state.defaultModel);
-  setCompareModelValue(getFallbackCompareModel(state.defaultModel));
+  setModelValue(selection.primary || state.defaultModel);
+  setCompareModelValue(selection.compare || getFallbackCompareModel(els.model.value));
+}
+
+function renderNativeModelOptions() {
+  return groupModelsForPicker().map((group) => {
+    if (group.provider === "openai") {
+      return `
+        <optgroup label="OpenAI">
+          ${group.models.map((model) => `<option value="${escapeHtml(model.key)}">${escapeHtml(model.label)}</option>`).join("")}
+        </optgroup>
+      `;
+    }
+    return group.upstreams.map((upstream) => `
+      <optgroup label="OpenRouter / ${escapeHtml(upstream.label)}">
+        ${upstream.models.map((model) => `<option value="${escapeHtml(model.key)}">${escapeHtml(model.label)}</option>`).join("")}
+      </optgroup>
+    `).join("");
+  }).join("");
 }
 
 function renderModelOptions() {
-  return state.models.map((model) => `
-    <button class="model-option" type="button" role="option" data-value="${escapeHtml(model.key)}">
+  return groupModelsForPicker().map((group) => {
+    if (group.provider === "openai") {
+      return `
+        <div class="model-option-group" role="presentation">
+          <div class="model-option-heading">OpenAI</div>
+          ${group.models.map(renderModelOption).join("")}
+        </div>
+      `;
+    }
+    return `
+      <div class="model-option-group" role="presentation">
+        <div class="model-option-heading">OpenRouter</div>
+        ${group.upstreams.map((upstream) => `
+          <div class="model-option-subgroup" role="presentation">
+            <div class="model-option-subheading">${escapeHtml(upstream.label)}</div>
+            ${upstream.models.map(renderModelOption).join("")}
+          </div>
+        `).join("")}
+      </div>
+    `;
+  }).join("");
+}
+
+function renderModelOption(model) {
+  return `
+    <button class="model-option" type="button" role="option" data-value="${escapeHtml(model.key)}" title="${escapeHtml(model.description || model.id)}">
       <span>${escapeHtml(compactModelLabel(model))}</span>
-      <small>${escapeHtml(model.provider)}</small>
+      <small>${escapeHtml(model.source === "discovered" ? "live" : "fallback")}</small>
     </button>
-  `).join("");
+  `;
+}
+
+function groupModelsForPicker() {
+  const openAiModels = [];
+  const openRouterGroups = new Map();
+  for (const model of state.models.filter((item) => item.recommended !== false)) {
+    if (model.provider === "openrouter") {
+      const upstream = model.upstreamProvider || extractOpenRouterUpstream(model.id);
+      if (!openRouterGroups.has(upstream)) {
+        openRouterGroups.set(upstream, {
+          id: upstream,
+          label: model.upstreamProviderLabel || upstreamProviderLabel(upstream),
+          models: []
+        });
+      }
+      openRouterGroups.get(upstream).models.push(model);
+    } else {
+      openAiModels.push(model);
+    }
+  }
+  const result = [];
+  if (openAiModels.length) {
+    result.push({ provider: "openai", models: openAiModels.sort(comparePickerModels) });
+  }
+  if (openRouterGroups.size) {
+    result.push({
+      provider: "openrouter",
+      upstreams: [...openRouterGroups.values()]
+        .sort((a, b) => upstreamRank(a.id) - upstreamRank(b.id) || a.label.localeCompare(b.label))
+        .map((group) => ({ ...group, models: group.models.sort(comparePickerModels) }))
+    });
+  }
+  return result;
+}
+
+function comparePickerModels(a, b) {
+  if (a.source !== b.source) return a.source === "discovered" ? -1 : 1;
+  return a.label.localeCompare(b.label);
+}
+
+function extractOpenRouterUpstream(id) {
+  return String(id || "").split("/")[0] || "other";
+}
+
+function upstreamRank(upstream) {
+  const order = ["openai", "anthropic", "google", "meta-llama", "deepseek", "x-ai", "mistralai", "qwen"];
+  const index = order.indexOf(upstream);
+  return index === -1 ? 99 : index;
+}
+
+function upstreamProviderLabel(upstream) {
+  const labels = {
+    openai: "OpenAI",
+    anthropic: "Anthropic",
+    google: "Google",
+    "meta-llama": "Meta Llama",
+    deepseek: "DeepSeek",
+    "x-ai": "xAI",
+    mistralai: "Mistral",
+    qwen: "Qwen"
+  };
+  return labels[upstream] || upstream;
 }
 
 function bindModelOptionClicks(menu, onSelect) {
@@ -569,6 +704,7 @@ function renderSingleMessage(message) {
         ${renderMessageFailure(message)}
         ${message.files?.length ? `<div class="message-files">${message.files.map(renderFileTile).join("")}</div>` : ""}
         ${renderMessageActions(message)}
+        ${renderMessageUsage(message)}
       </div>
     </article>
   `;
@@ -589,6 +725,7 @@ function renderCompareGroup(messages) {
             ${renderMarkdown(message.content || statusText(message))}
             ${renderMessageFailure(message)}
             ${renderMessageActions(message)}
+            ${renderMessageUsage(message)}
           </div>
         </section>
       `).join("")}
@@ -629,6 +766,12 @@ function renderMessageActions(message) {
 function renderMessageFailure(message) {
   if (message.status !== "failed" || !message.error) return "";
   return `<div class="message-failure">${escapeHtml(message.error)}</div>`;
+}
+
+function renderMessageUsage(message) {
+  const usage = normalizeUsage(message.usage);
+  if (!usage) return "";
+  return `<div class="message-usage">${escapeHtml(usage)}</div>`;
 }
 
 async function handleMessageActionClick(event) {
@@ -907,6 +1050,22 @@ function statusText(message) {
   return "";
 }
 
+function normalizeUsage(usage) {
+  if (!usage || typeof usage !== "object") return "";
+  const input = usage.input_tokens ?? usage.prompt_tokens ?? usage.promptTokens ?? usage.inputTokens;
+  const output = usage.output_tokens ?? usage.completion_tokens ?? usage.completionTokens ?? usage.outputTokens;
+  const total = usage.total_tokens ?? usage.totalTokens ?? (Number(input || 0) + Number(output || 0) || null);
+  const parts = [];
+  if (Number.isFinite(Number(input))) parts.push(`${formatCount(input)} in`);
+  if (Number.isFinite(Number(output))) parts.push(`${formatCount(output)} out`);
+  if (!parts.length && Number.isFinite(Number(total))) parts.push(`${formatCount(total)} total`);
+  return parts.length ? `${parts.join(" / ")} tokens` : "";
+}
+
+function formatCount(value) {
+  return Number(value || 0).toLocaleString();
+}
+
 function shortId(id) {
   return id.slice(0, 8);
 }
@@ -1023,6 +1182,7 @@ function compactModelLabel(model) {
   return model.label
     .replace(/^OpenRouter\s+/i, "")
     .replace(/^GPT-/i, "GPT ")
+    .replace(/\bGpt\b/g, "GPT")
     .replace(/\s+mini$/i, " mini");
 }
 

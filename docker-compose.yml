@@ -1,0 +1,15 @@
+services:
+  conversation-agent:
+    build: .
+    ports:
+      - "4613:4613"
+    env_file:
+      - .env
+    environment:
+      APP_PORT: 4613
+      APP_HOST: 0.0.0.0
+      APP_PUBLIC_URL: http://127.0.0.1:4613
+    volumes:
+      - ./data:/app/data
+      - ./uploads:/app/uploads
+    restart: unless-stopped
