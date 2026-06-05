@@ -6,7 +6,7 @@ const OPENAI_MODELS_API_URL = "https://api.openai.com/v1/models";
 const OPENROUTER_MODELS_API_URL = "https://openrouter.ai/api/v1/models";
 const MODEL_CATALOG_TTL_MS = 20 * 60 * 1000;
 const OPENAI_DIRECT_MODEL_LIMIT = 4;
-const OPENROUTER_MODELS_PER_UPSTREAM = 3;
+const OPENROUTER_MODELS_PER_UPSTREAM = 6;
 const OPENROUTER_UPSTREAM_ORDER = ["openai", "anthropic", "google", "meta-llama", "deepseek", "x-ai", "mistralai", "qwen"];
 
 const openRouterModels = [
@@ -251,24 +251,43 @@ function compareModelFreshness(a, b) {
 }
 
 function modelScore(id) {
-  const lower = String(id || "").toLowerCase();
+  const lower = normalizeModelIdForScoring(id);
   let score = 0;
-  if (lower.includes("latest")) score += 5000;
+  if (lower.includes("latest")) score += 10000;
   if (lower.includes("preview")) score -= 120;
   if (lower.includes("beta")) score -= 160;
   if (lower.includes("mini")) score -= 30;
   if (lower.includes("nano")) score -= 90;
   if (lower.includes("turbo")) score -= 20;
   if (lower.includes("instruct")) score -= 8;
-  if (lower.includes("gpt")) score += 1200;
-  if (lower.includes("claude")) score += 1150;
-  if (lower.includes("gemini")) score += 1100;
-  if (lower.includes("llama")) score += 900;
-  const numbers = lower.match(/\d+(?:\.\d+)?/g) || [];
-  numbers.slice(0, 4).forEach((value, index) => {
-    score += Number(value) * (100 / (index + 1));
-  });
+  if (lower.includes("pro")) score += 5;
+  if (lower.includes("free")) score -= 15;
+
+  const gptVersion = lower.match(/\bgpt-(\d+(?:\.\d+)?)/)?.[1];
+  const claudeVersion = lower.match(/\bclaude-(?:opus|sonnet|haiku)?-?(\d+(?:\.\d+)?)/)?.[1];
+  const geminiVersion = lower.match(/\bgemini-(\d+(?:\.\d+)?)/)?.[1];
+  const llamaVersion = lower.match(/\bllama-(\d+(?:\.\d+)?)/)?.[1];
+  const qwenVersion = lower.match(/\bqwen-?(\d+(?:\.\d+)?)/)?.[1];
+
+  if (lower.includes("gpt-chat-latest")) score += 9500;
+  else if (gptVersion) score += 7000 + Number(gptVersion) * 100;
+  else if (lower.includes("gpt-oss")) score += 6200;
+  else if (claudeVersion) score += 6800 + Number(claudeVersion) * 100;
+  else if (geminiVersion) score += 6500 + Number(geminiVersion) * 100;
+  else if (llamaVersion) score += 5600 + Number(llamaVersion) * 100;
+  else if (qwenVersion) score += 5400 + Number(qwenVersion) * 100;
+  else if (lower.includes("deepseek")) score += 5200;
+  else if (lower.includes("grok")) score += 5100;
+  else if (lower.includes("mistral")) score += 5000;
+
   return score;
+}
+
+function normalizeModelIdForScoring(id) {
+  return String(id || "")
+    .toLowerCase()
+    .replace(/-\d{4}-\d{2}-\d{2}(?=$|[:/-])/g, "")
+    .replace(/-\d{8}(?=$|[:/-])/g, "");
 }
 
 function isRecommendedChatModel(id, provider, record = null) {
