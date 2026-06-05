@@ -7,6 +7,7 @@ import { addMessage, createConversation, deleteMessagesAfter, getConversation, g
 import { getDefaultModel, getModelCatalog, refreshModelCatalog, resolveModel, streamAssistantResponse } from "./providers.js";
 import { saveUploadedFile } from "./uploads.js";
 import { buildMemorySnapshot, createEmptyMemory, prepareMessagesForModel, shouldUpdateMemory } from "./memory.js";
+import { BRIEFING_PERSONA_ID, briefingPersona, CHAIRMAN_PERSONA_ID, chairmanPersona, listCouncilPacks, listPersonas, resolvePersona } from "./personas.js";
 
 await loadEnvFile();
 
@@ -50,6 +51,8 @@ async function handleApi(req, res) {
       },
       hasOpenAiKey: Boolean(process.env.OPENAI_API_KEY),
       hasOpenRouterKey: Boolean(process.env.OPENROUTER_API_KEY),
+      personas: listPersonas(),
+      councilPacks: listCouncilPacks(),
       conversations: await listConversations()
     });
     return;
@@ -182,12 +185,14 @@ async function streamConversationMessage(req, res, conversationId) {
 
   const body = await readJson(req);
   const content = String(body.content || "").trim();
-  const selectedModels = resolveRequestedModels(body, conversation);
-  const model = selectedModels[0];
+  const seats = resolveRequestedSeats(body, conversation);
+  const model = seats[0].model;
   const fileIds = Array.isArray(body.fileIds) ? body.fileIds : [];
   if (!content && fileIds.length === 0) return sendJson(res, 400, { error: "Message content or file is required" });
 
   const files = await getFiles(fileIds);
+  const previousMessages = await listMessages(conversationId);
+  const pendingBriefing = findPendingBriefing(previousMessages);
   await updateConversation(conversationId, {
     model,
     title: conversation.title === "New chat" && content ? createTitle(content) : conversation.title
@@ -202,7 +207,193 @@ async function streamConversationMessage(req, res, conversationId) {
     turnId: randomUUID()
   });
   const history = await listMessages(conversationId);
-  await streamAssistantsForHistory({ req, res, conversationId, models: selectedModels, files, history, userMessage });
+  if (!pendingBriefing && shouldAskBriefing({ content, fileIds, seats, history: previousMessages })) {
+    await streamBriefingPartner({ req, res, conversationId, model, userMessage, content, files });
+    return;
+  }
+  const councilHistory = pendingBriefing ? buildBriefedCouncilHistory(history, pendingBriefing, userMessage) : history;
+  await streamAssistantsForHistory({ req, res, conversationId, seats, files, history: councilHistory, userMessage, updateMemoryAfter: true });
+}
+
+async function streamBriefingPartner({ req, res, conversationId, model, userMessage, content, files }) {
+  const briefingMessage = await addMessage({
+    conversationId,
+    role: "assistant",
+    content: "",
+    model,
+    status: "streaming",
+    turnId: userMessage.turnId,
+    candidateIndex: 0,
+    personaId: BRIEFING_PERSONA_ID,
+    personaName: briefingPersona.name
+  });
+  const text = buildBriefingQuestions(content, files);
+  let accumulated = "";
+  let aborted = false;
+  req.on("close", () => {
+    aborted = true;
+  });
+
+  res.writeHead(200, {
+    "Content-Type": "text/event-stream; charset=utf-8",
+    "Cache-Control": "no-cache, no-transform",
+    "Connection": "keep-alive",
+    "X-Accel-Buffering": "no"
+  });
+
+  writeEvent(res, "message.started", { userMessage, assistantMessages: [briefingMessage] });
+  for (const chunk of chunkText(text, 18)) {
+    if (aborted) break;
+    accumulated += chunk;
+    writeEvent(res, "message.delta", { messageId: briefingMessage.id, delta: chunk });
+  }
+
+  const status = aborted ? "cancelled" : "completed";
+  await updateMessage(briefingMessage.id, {
+    content: accumulated,
+    status
+  });
+  writeEvent(res, status === "completed" ? "message.completed" : "message.failed", {
+    messageId: briefingMessage.id,
+    status,
+    providerResponseId: "briefing-partner",
+    usage: null,
+    error: status === "cancelled" ? "Request cancelled" : undefined
+  });
+  res.end();
+}
+
+function shouldAskBriefing({ content, fileIds, seats, history }) {
+  if (!shouldCreateChairman(seats)) return false;
+  if (fileIds.length) return false;
+  if (/\b(run it|run with assumptions|use assumptions|go ahead|send to council)\b/i.test(content)) return false;
+
+  const words = content.toLowerCase().match(/[a-z0-9$%.-]+/g) || [];
+  if (words.length <= 8) return true;
+
+  const contextSignals = [
+    /\b(my|i|we|our)\b/i,
+    /\bgoal|criteria|constraint|budget|income|cash|timeline|horizon|risk|location|city|market|customer|user|price|cost|deadline\b/i,
+    /\b\d+\s*(year|month|week|day|k|m|%|dollar|usd|rs|inr)s?\b/i,
+    /[$%]/,
+    /\bbecause|leaning|prefer|must|cannot|can't|need|want\b/i
+  ];
+  const signalCount = contextSignals.reduce((count, pattern) => count + (pattern.test(content) ? 1 : 0), 0);
+  if (words.length <= 22 && signalCount < 2) return true;
+  if (/\b(vs|versus|better|should i|worth it|good idea)\b/i.test(content) && signalCount < 2) return true;
+  return false;
+}
+
+function buildBriefingQuestions(content, files) {
+  const attachmentNote = files.length ? "I see an attachment, so answer only what is not already in the file." : "";
+  return [
+    "**I need a sharper brief before sending this to the council.**",
+    attachmentNote,
+    "",
+    "1. What decision are you actually trying to make?",
+    "2. What option are you leaning toward, if any?",
+    "3. What does \"better\" mean here: money, speed, risk, freedom, stability, growth, or something else?",
+    "4. What time horizon should the council optimize for?",
+    "5. What constraints or facts would make the wrong answer costly?",
+    "",
+    "Reply with any numbers you want. Short answers are fine. If you want the council to run without more context, say \"run with assumptions.\""
+  ].filter(Boolean).join("\n");
+}
+
+function chunkText(text, size = 18) {
+  const chunks = [];
+  for (let index = 0; index < text.length; index += size) {
+    chunks.push(text.slice(index, index + size));
+  }
+  return chunks;
+}
+
+function findPendingBriefing(messages) {
+  const last = messages[messages.length - 1];
+  if (!last || last.role !== "assistant" || last.personaId !== BRIEFING_PERSONA_ID) return null;
+  const originalUser = [...messages].reverse().find((message) => message.role === "user" && message.createdAt < last.createdAt);
+  if (!originalUser) return null;
+  return {
+    briefingMessage: last,
+    originalUser
+  };
+}
+
+function buildBriefedCouncilHistory(history, pendingBriefing, currentUserMessage) {
+  const councilBrief = renderCouncilBrief({
+    originalPrompt: pendingBriefing.originalUser.content,
+    briefingQuestions: pendingBriefing.briefingMessage.content,
+    userAnswers: currentUserMessage.content
+  });
+  return [
+    ...history,
+    {
+      id: `briefed-council-${currentUserMessage.id}`,
+      conversationId: currentUserMessage.conversationId,
+      role: "user",
+      content: councilBrief,
+      model: currentUserMessage.model,
+      status: "completed",
+      files: [],
+      turnId: currentUserMessage.turnId,
+      candidateIndex: null,
+      personaId: null,
+      personaName: null,
+      createdAt: currentUserMessage.createdAt,
+      updatedAt: currentUserMessage.updatedAt
+    }
+  ];
+}
+
+function renderCouncilBrief({ originalPrompt, briefingQuestions, userAnswers }) {
+  return [
+    "Council Brief from Briefing Partner.",
+    "Use the raw user wording and the normalized frame. Do not discard nuance from the raw text.",
+    "",
+    "Original user prompt:",
+    originalPrompt || "",
+    "",
+    "Briefing Partner questions:",
+    briefingQuestions || "",
+    "",
+    "User follow-up answers, raw:",
+    userAnswers || "",
+    "",
+    "Normalized decision frame:",
+    `Decision to make: ${inferDecisionFrame(originalPrompt, userAnswers)}`,
+    `User leaning: ${inferLeaning(originalPrompt, userAnswers)}`,
+    `Success criteria: ${inferSuccessCriteria(originalPrompt, userAnswers)}`,
+    `Constraints/time horizon: ${inferConstraints(originalPrompt, userAnswers)}`,
+    "Known unknowns: Any missing numbers, timeline, budget, risk tolerance, location, market facts, or personal constraints not provided above.",
+    "Default assumption: If a detail is missing, make a reasonable default assumption, state it, and still make a call."
+  ].join("\n");
+}
+
+function inferDecisionFrame(originalPrompt, userAnswers) {
+  const text = `${originalPrompt || ""} ${userAnswers || ""}`.replace(/\s+/g, " ").trim();
+  if (!text) return "Not explicitly stated.";
+  return text.length > 180 ? `${text.slice(0, 177)}...` : text;
+}
+
+function inferLeaning(originalPrompt, userAnswers) {
+  const text = `${originalPrompt || ""}\n${userAnswers || ""}`;
+  const leaning = text.match(/\b(?:leaning|prefer|option|choose|decision|thesis)\s*(?:is|toward|to|:)?\s*([^\n.]+)/i);
+  if (leaning?.[1]) return leaning[1].trim().slice(0, 160);
+  return "Not explicit. Infer from the user's wording, but mark it as an assumption.";
+}
+
+function inferSuccessCriteria(originalPrompt, userAnswers) {
+  const text = `${originalPrompt || ""}\n${userAnswers || ""}`;
+  const criteria = text.match(/\b(?:better means|goal|criteria|optimize|maximize|care about|success)\s*(?:is|are|for|:)?\s*([^\n.]+)/i);
+  if (criteria?.[1]) return criteria[1].trim().slice(0, 180);
+  return "Not explicit. Ask whether money, speed, risk, freedom, stability, growth, or quality is being optimized only if it would change the decision.";
+}
+
+function inferConstraints(originalPrompt, userAnswers) {
+  const text = `${originalPrompt || ""}\n${userAnswers || ""}`;
+  const constraints = text.match(/\b(?:constraint|timeline|horizon|budget|deadline|must|cannot|can't|risk)\s*(?:is|are|:)?\s*([^\n.]+)/i);
+  if (constraints?.[1]) return constraints[1].trim().slice(0, 180);
+  return "Not explicit. Use reasonable defaults and state them.";
 }
 
 async function regenerateConversationMessage(req, res, conversationId) {
@@ -215,33 +406,56 @@ async function regenerateConversationMessage(req, res, conversationId) {
   const lastUser = lastUserIndex === -1 ? null : messages[lastUserIndex];
   if (!lastUser) return sendJson(res, 400, { error: "No user message to regenerate from" });
   const trailingAssistants = messages.slice(lastUserIndex + 1).filter((message) => message.role === "assistant");
-  const selectedModels = resolveRequestedModels(body, conversation, trailingAssistants.map((message) => message.model).filter(Boolean));
-  const model = selectedModels[0];
+  const seats = resolveRequestedSeats(body, conversation, trailingAssistants);
+  const model = seats[0].model;
+  const shouldRegenerateBriefing = trailingAssistants.some((message) => message.personaId === BRIEFING_PERSONA_ID) &&
+    shouldAskBriefing({ content: lastUser.content || "", fileIds: lastUser.files || [], seats, history: messages.slice(0, lastUserIndex) });
+  const pendingBriefing = findPendingBriefing(messages.slice(0, lastUserIndex));
 
   await deleteMessagesAfter(conversationId, lastUser.id);
   await updateConversation(conversationId, { model });
   const files = await getFiles(lastUser.files || []);
+  if (shouldRegenerateBriefing) {
+    await streamBriefingPartner({ req, res, conversationId, model, userMessage: lastUser, content: lastUser.content || "", files });
+    return;
+  }
   const history = await listMessages(conversationId);
-  await streamAssistantsForHistory({ req, res, conversationId, models: selectedModels, files, history, userMessage: null });
+  const regenerateHistory = pendingBriefing ? buildBriefedCouncilHistory(history, pendingBriefing, lastUser) : history;
+  await streamAssistantsForHistory({ req, res, conversationId, seats, files, history: regenerateHistory, userMessage: null, updateMemoryAfter: false });
 }
 
-async function streamAssistantsForHistory({ req, res, conversationId, models, files, history, userMessage }) {
+async function streamAssistantsForHistory({ req, res, conversationId, seats, files, history, userMessage, updateMemoryAfter = true }) {
   const memory = await getConversationMemory(conversationId);
-  const modelMessages = prepareMessagesForModel(history, memory);
   const lastHistoryUserIndex = findLastIndex(history, (message) => message.role === "user");
   const turnId = userMessage?.turnId || history[lastHistoryUserIndex]?.turnId || randomUUID();
-  const assistantMessages = [];
-  for (const [index, model] of models.entries()) {
-    assistantMessages.push(await addMessage({
+  const expertMessages = [];
+  for (const [index, seat] of seats.entries()) {
+    expertMessages.push(await addMessage({
       conversationId,
       role: "assistant",
       content: "",
-      model,
+      model: seat.model,
       status: "streaming",
       turnId,
-      candidateIndex: index
+      candidateIndex: index,
+      personaId: seat.personaId,
+      personaName: seat.personaName
     }));
   }
+  const chairmanMessage = shouldCreateChairman(seats)
+    ? await addMessage({
+        conversationId,
+        role: "assistant",
+        content: "",
+        model: seats[0].model,
+        status: "streaming",
+        turnId,
+        candidateIndex: -1,
+        personaId: CHAIRMAN_PERSONA_ID,
+        personaName: chairmanPersona.name
+      })
+    : null;
+  const assistantMessages = chairmanMessage ? [chairmanMessage, ...expertMessages] : expertMessages;
   const abortController = new AbortController();
 
   req.on("close", () => abortController.abort());
@@ -257,8 +471,10 @@ async function streamAssistantsForHistory({ req, res, conversationId, models, fi
 
   const streamOne = async (assistantMessage) => {
     let accumulated = "";
+    const persona = resolvePersona(assistantMessage.personaId);
+    const modelMessages = prepareMessagesForModel(history, memory, { personaId: persona?.id || null });
     try {
-      for await (const event of streamAssistantResponse({ model: assistantMessage.model, messages: modelMessages, files, memory, signal: abortController.signal })) {
+      for await (const event of streamAssistantResponse({ model: assistantMessage.model, messages: modelMessages, files, memory, persona, signal: abortController.signal })) {
         if (event.type === "message.delta") {
           accumulated += event.delta;
           writeEvent(res, event.type, { messageId: assistantMessage.id, delta: event.delta });
@@ -269,6 +485,10 @@ async function streamAssistantsForHistory({ req, res, conversationId, models, fi
             providerResponseId: event.providerResponseId,
             usage: event.usage
           });
+          assistantMessage.content = accumulated;
+          assistantMessage.status = "completed";
+          assistantMessage.providerResponseId = event.providerResponseId;
+          assistantMessage.usage = event.usage;
           writeEvent(res, event.type, { messageId: assistantMessage.id, providerResponseId: event.providerResponseId, usage: event.usage });
         }
       }
@@ -279,17 +499,93 @@ async function streamAssistantsForHistory({ req, res, conversationId, models, fi
         status,
         error: error.message
       });
+      assistantMessage.content = accumulated;
+      assistantMessage.status = status;
+      assistantMessage.error = error.message;
       writeEvent(res, "message.failed", { messageId: assistantMessage.id, status, error: error.message });
     }
   };
 
   try {
-    await Promise.all(assistantMessages.map(streamOne));
-    const updatedMemory = await refreshConversationMemory(conversationId, memory);
-    if (updatedMemory) writeEvent(res, "memory.updated", { memory: updatedMemory });
+    await Promise.all(expertMessages.map(streamOne));
+    if (chairmanMessage && !abortController.signal.aborted) {
+      await streamChairman({ chairmanMessage, expertMessages, history, memory, signal: abortController.signal, write: (event, data) => writeEvent(res, event, data) });
+    }
+    if (updateMemoryAfter) {
+      const updatedMemory = await refreshConversationMemory(conversationId, memory);
+      if (updatedMemory) writeEvent(res, "memory.updated", { memory: updatedMemory });
+    }
   } finally {
     res.end();
   }
+}
+
+async function streamChairman({ chairmanMessage, expertMessages, history, memory, signal, write }) {
+  let accumulated = "";
+  try {
+    const messages = buildChairmanMessages(history, expertMessages);
+    for await (const event of streamAssistantResponse({ model: chairmanMessage.model, messages, files: [], memory, persona: chairmanPersona, signal })) {
+      if (event.type === "message.delta") {
+        accumulated += event.delta;
+        write(event.type, { messageId: chairmanMessage.id, delta: event.delta });
+      } else if (event.type === "message.completed") {
+        await updateMessage(chairmanMessage.id, {
+          content: accumulated,
+          status: "completed",
+          providerResponseId: event.providerResponseId,
+          usage: event.usage
+        });
+        chairmanMessage.content = accumulated;
+        chairmanMessage.status = "completed";
+        write(event.type, { messageId: chairmanMessage.id, providerResponseId: event.providerResponseId, usage: event.usage });
+      }
+    }
+  } catch (error) {
+    const status = signal.aborted ? "cancelled" : "failed";
+    await updateMessage(chairmanMessage.id, {
+      content: accumulated,
+      status,
+      error: error.message
+    });
+    chairmanMessage.content = accumulated;
+    chairmanMessage.status = status;
+    chairmanMessage.error = error.message;
+    write("message.failed", { messageId: chairmanMessage.id, status, error: error.message });
+  }
+}
+
+function buildChairmanMessages(history, expertMessages) {
+  const lastUser = [...history].reverse().find((message) => message.role === "user");
+  const personaResponses = expertMessages.map((message) => {
+    const name = message.personaName || resolvePersona(message.personaId)?.name || message.model || "Council seat";
+    const status = message.status && message.status !== "completed" ? `Status: ${message.status}\n` : "";
+    const error = message.error ? `Error: ${message.error}\n` : "";
+    return `## ${name}\n${status}${error}${message.content?.trim() || "(No response captured.)"}`;
+  }).join("\n\n");
+
+  return [
+    {
+      role: "user",
+      content: [
+        "Synthesize the active council responses for the latest user topic into a decisive go-forward brief.",
+        "You must use all active persona responses below. Your job is not to summarize passively; it is to make the best decision under uncertainty.",
+        "If the user asked whether X is better than Y, choose X, choose Y, or reframe the comparison. Do not answer only with 'it depends'.",
+        "If facts are missing, state default assumptions, give a confidence estimate, and say exactly what would change the decision.",
+        "The final recommendation must be a concrete action, not a request for generic analysis.",
+        "",
+        "User topic:",
+        lastUser?.content || "",
+        "",
+        "Active persona responses:",
+        "",
+        personaResponses
+      ].join("\n")
+    }
+  ];
+}
+
+function shouldCreateChairman(seats) {
+  return seats.length > 1 && seats.some((seat) => seat.personaId);
 }
 
 function findLastIndex(items, predicate) {
@@ -313,9 +609,57 @@ function resolveRequestedModels(body, conversation, fallbackModels = []) {
     const model = resolveModel(value)?.key;
     if (!model || selected.includes(model)) continue;
     selected.push(model);
-    if (selected.length === 2) break;
+    if (selected.length === 3) break;
   }
   return selected.length ? selected : [getDefaultModel()];
+}
+
+function resolveRequestedSeats(body, conversation, fallbackMessages = []) {
+  const requestedSeats = Array.isArray(body.seats) ? body.seats : [];
+  const seats = [];
+
+  if (requestedSeats.length) {
+    for (const rawSeat of requestedSeats) {
+      const model = resolveModel(rawSeat?.model || body.model || conversation.model || getDefaultModel())?.key;
+      const persona = resolvePersona(rawSeat?.personaId);
+      if (persona?.id === CHAIRMAN_PERSONA_ID) continue;
+      if (!model) continue;
+      addSeat(seats, { model, persona });
+      if (seats.length >= 3) break;
+    }
+    if (seats.length) return seats;
+  }
+
+  for (const message of fallbackMessages) {
+    if (message.personaId === CHAIRMAN_PERSONA_ID) continue;
+    const model = resolveModel(message.model || conversation.model || getDefaultModel())?.key;
+    const persona = resolvePersona(message.personaId);
+    if (!model) continue;
+    addSeat(seats, {
+      model,
+      persona,
+      personaName: persona?.name || message.personaName || null
+    });
+    if (seats.length >= 3) break;
+  }
+  if (seats.length) return seats;
+
+  return resolveRequestedModels(body, conversation).map((model) => ({
+    model,
+    personaId: null,
+    personaName: null
+  }));
+}
+
+function addSeat(seats, { model, persona, personaName = null }) {
+  const personaId = persona?.id || null;
+  if (personaId && seats.some((seat) => seat.personaId === personaId)) return;
+  if (!personaId && seats.some((seat) => !seat.personaId && seat.model === model)) return;
+  seats.push({
+    model,
+    personaId,
+    personaName: persona?.name || personaName
+  });
 }
 
 async function getConversationMemory(conversationId) {

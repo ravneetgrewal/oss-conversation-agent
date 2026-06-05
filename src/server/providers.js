@@ -123,13 +123,13 @@ export async function refreshModelCatalog() {
   return { models, ...modelCatalog };
 }
 
-export async function* streamAssistantResponse({ model, messages, files = [], memory = null, signal }) {
+export async function* streamAssistantResponse({ model, messages, files = [], memory = null, persona = null, signal }) {
   const selected = resolveModel(model) || resolveModel(getDefaultModel());
   if (selected.provider === "openrouter") {
-    yield* streamOpenRouterResponse({ model: selected.id, label: selected.label, messages, files, memory, signal });
+    yield* streamOpenRouterResponse({ model: selected.id, label: selected.label, messages, files, memory, persona, signal });
     return;
   }
-  yield* streamOpenAiResponse({ model: selected.id, messages, files, memory, signal });
+  yield* streamOpenAiResponse({ model: selected.id, messages, files, memory, persona, signal });
 }
 
 async function fetchOpenAiModels() {
@@ -344,9 +344,9 @@ function formatModelLabel(id) {
     .replace(/\bAi\b/g, "AI");
 }
 
-async function* streamOpenRouterResponse({ model, label, messages, files = [], memory = null, signal }) {
+async function* streamOpenRouterResponse({ model, label, messages, files = [], memory = null, persona = null, signal }) {
   if (!process.env.OPENROUTER_API_KEY) {
-    yield* streamProviderDemoResponse({ provider: "OpenRouter", model, files, memory, messages, signal });
+    yield* streamProviderDemoResponse({ provider: "OpenRouter", model, files, memory, messages, persona, signal });
     return;
   }
 
@@ -361,7 +361,9 @@ async function* streamOpenRouterResponse({ model, label, messages, files = [], m
     },
     body: JSON.stringify({
       model,
-      messages: await toChatMessages(messages, files, memory),
+      messages: await toChatMessages(messages, files, memory, persona),
+      temperature: getModelTemperature(),
+      top_p: 1,
       stream: true
     })
   });
@@ -374,9 +376,15 @@ async function* streamOpenRouterResponse({ model, label, messages, files = [], m
   yield* parseChatCompletionSse(response.body, label);
 }
 
-async function toChatMessages(messages, files, memory) {
+function getModelTemperature() {
+  const value = Number(process.env.MODEL_TEMPERATURE ?? 0.1);
+  return Number.isFinite(value) ? value : 0.1;
+}
+
+async function toChatMessages(messages, files, memory, persona) {
   const system = [
     process.env.DEFAULT_SYSTEM_PROMPT || "You are a concise, useful conversational agent.",
+    persona?.prompt || "",
     memory?.enabled
       ? "The backend may include a per-chat memory block as the first user message. Treat that memory as durable context for this conversation, but prefer newer explicit user instructions when they conflict."
       : ""
@@ -484,13 +492,15 @@ function extractProviderErrorMessage(body, error) {
   }
 }
 
-async function* streamProviderDemoResponse({ provider, model, files, memory, messages, signal }) {
+async function* streamProviderDemoResponse({ provider, model, files, memory, messages, persona, signal }) {
   const attachmentNote = files.length ? ` I can see ${files.length} local attachment${files.length === 1 ? "" : "s"}.` : "";
   const memoryNote = memory?.summary ? ` Per-chat memory is active: ${memory.summary.slice(0, 160)}` : "";
+  const personaNote = persona ? ` I am responding from the ${persona.name} council seat.` : "";
   const lastUser = [...messages].reverse().find((message) => message.role === "user" && !message.id?.startsWith("memory-"));
   const text = [
     `${provider} demo mode is active because OPENROUTER_API_KEY is not set.`,
     ` The selected model is ${model}.`,
+    personaNote,
     attachmentNote,
     memoryNote,
     lastUser ? ` Your latest message was: "${lastUser.content.slice(0, 120)}".` : "",

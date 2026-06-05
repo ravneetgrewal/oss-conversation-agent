@@ -1,21 +1,45 @@
 # OSS Conversation Agent
 
-![OSS Conversation Agent new chat screen](screen.png)
+![OSS Conversation Agent council prompt framing](framing.png)
 
-OSS Conversation Agent is a local-first ChatGPT-style conversation shell for building and testing modern AI assistants across provider APIs. It starts with OpenAI Responses API support and includes OpenRouter as a second provider path, while keeping the UI and backend provider-neutral.
+OSS Conversation Agent is a local-first ChatGPT-style conversation shell for building and testing modern AI assistants across provider APIs. It supports regular single-assistant chats, but its main workflow is Council mode: a small board of expert LLM personas that works through a decision from different operating viewpoints.
 
 The product is designed around the core expectations of a serious chat agent: streamed responses, model selection, attachment upload and review, per-chat memory, markdown rendering, retry/regenerate flows, and response actions for copying or exporting answers.
 
-## Compare Mode
+## Council Mode
 
-![OSS Conversation Agent compare mode](compare-feature.png)
+![OSS Conversation Agent council setup](council.png)
 
-Compare mode lets one prompt run against two selected models at the same time. Each response streams into its own pane, so the user can compare tone, reasoning, markdown quality, and provider behavior without leaving the conversation. If one model fails, the other keeps streaming and the failed pane keeps any partial output with the provider error shown inline.
+Council mode turns one prompt into a focused advisory board. Pick a pack, choose two or three seats, and assign each seat to the same model or to different models when you want provider or model diversity. Each persona is instructed to stay inside its assigned role and answer from that operating viewpoint only.
+
+Council packs provide preset boards for common work:
+
+- Executive Decision Board: Principles Partner, Risk Underwriter, and Operating Partner.
+- Investment Committee: Capital Allocator, Diligence Lead, and Scenario Strategist.
+- Product & Growth Council: Customer Advocate, Market Maker, and Execution Lead.
+
+When a Council prompt is too thin for a useful answer, the Briefing Partner asks a short numbered question set first. The user can reply in free text, and the council receives both the raw wording and a normalized decision brief.
+
+After the active personas respond, the Chairman Brief synthesizes their answers into a go-forward call with confidence, assumptions, risks, and next actions. The default model temperature is kept low so regenerate is closer to a repeatable decision review than a creative rewrite.
+
+Council responses can be read in either layout:
+
+![OSS Conversation Agent council columns](<council response - columns.png>)
+
+Columns mode keeps the expert responses side by side for fast comparison.
+
+![OSS Conversation Agent council tabs](<council response - tabbed.png>)
+
+Tabs mode reduces scroll and puts the Chairman Brief first, with each expert persona behind its own tab.
 
 ## Features
 
 - Streaming assistant responses over server-sent events.
-- Two-model Compare mode with parallel streaming response panes.
+- Two- or three-seat Council mode with parallel persona response panes.
+- Council packs with nine strict advisory personas across decision, investment, and product/growth work.
+- Briefing Partner intake for underspecified council prompts.
+- Chairman Brief synthesis from the active persona responses.
+- Column and tab layouts for Council answers.
 - Provider registry with dynamically refreshed OpenAI and OpenRouter model catalogs.
 - Per-chat memory manager with inspectable and editable memory.
 - File uploads with named attachment tiles and file-open links.
@@ -24,7 +48,8 @@ Compare mode lets one prompt run against two selected models at the same time. E
 - Markdown rendering for headings, lists, links, code blocks, blockquotes, and tables.
 - Response controls for copy, markdown download, and regenerate.
 - Per-response input/output token usage when the provider returns usage data.
-- Per-pane failure handling for provider errors during Compare mode.
+- Per-pane failure handling for provider errors during Council mode.
+- Low default model temperature for more repeatable decision analysis.
 - Dependency-free Node server and browser client.
 - Local JSON persistence for conversations, messages, files, and memory.
 
@@ -79,6 +104,8 @@ Compose mounts `./data` and `./uploads` into the container so conversations and 
 OpenAI uses the Responses API and supports multimodal file input through the app's upload pipeline.
 
 OpenRouter uses its OpenAI-compatible chat completions endpoint. Some models may reject attachments or multimodal content. When that happens, the app surfaces a user-friendly error built from the provider's actual response.
+
+`MODEL_TEMPERATURE` controls sampling for provider calls. The default is `0.1`, which favors repeatability for decision work while still leaving the model enough room to produce useful structure.
 
 ## Project Structure
 

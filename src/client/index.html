@@ -92,7 +92,12 @@
             <button id="attach-button" class="round-button composer-icon" type="button" title="Attach file" aria-label="Attach file">+</button>
             <input id="file-input" type="file" multiple hidden>
             <textarea id="message-input" rows="1" placeholder="Ask anything" autocomplete="off"></textarea>
-            <button id="compare-toggle" class="compare-toggle" type="button" aria-pressed="false">Compare</button>
+            <button id="compare-toggle" class="compare-toggle" type="button" aria-pressed="false">Council</button>
+            <div id="council-view-toggle" class="council-view-toggle" role="group" aria-label="Council response view" hidden>
+              <button type="button" data-council-view="columns" aria-pressed="true">Columns</button>
+              <button type="button" data-council-view="tabs" aria-pressed="false">Tabs</button>
+            </div>
+            <div id="council-panel" class="council-panel" hidden></div>
             <div class="model-picker" id="model-picker">
               <button id="model-picker-button" class="model-picker-button" type="button" aria-haspopup="listbox" aria-expanded="false">
                 <span id="model-picker-label">Model</span>

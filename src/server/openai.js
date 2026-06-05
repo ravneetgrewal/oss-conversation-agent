@@ -46,9 +46,9 @@ export function getDefaultModel() {
   return models.some((model) => model.key === configured || model.id === configured) ? configured : "openai:gpt-5.4";
 }
 
-export async function* streamOpenAiResponse({ model, messages, files = [], memory = null, signal }) {
+export async function* streamOpenAiResponse({ model, messages, files = [], memory = null, persona = null, signal }) {
   if (!process.env.OPENAI_API_KEY) {
-    yield* streamDemoResponse({ model, files, memory, messages, signal });
+    yield* streamDemoResponse({ model, files, memory, messages, persona, signal });
     return;
   }
 
@@ -61,8 +61,10 @@ export async function* streamOpenAiResponse({ model, messages, files = [], memor
     },
     body: JSON.stringify({
       model,
-      instructions: buildInstructions(memory),
+      instructions: buildInstructions(memory, persona),
       input: await toOpenAiInput(messages, files),
+      temperature: getModelTemperature(),
+      top_p: 1,
       stream: true,
       store: true
     })
@@ -76,12 +78,19 @@ export async function* streamOpenAiResponse({ model, messages, files = [], memor
   yield* parseOpenAiSse(response.body);
 }
 
-function buildInstructions(memory) {
+function getModelTemperature() {
+  const value = Number(process.env.MODEL_TEMPERATURE ?? 0.1);
+  return Number.isFinite(value) ? value : 0.1;
+}
+
+function buildInstructions(memory, persona) {
   const baseInstruction = process.env.DEFAULT_SYSTEM_PROMPT || "You are a concise, useful conversational agent.";
-  if (!memory?.enabled) return baseInstruction;
   return [
     baseInstruction,
-    "The backend may include a per-chat memory block as the first user message. Treat that memory as durable context for this conversation, but prefer newer explicit user instructions when they conflict."
+    persona?.prompt || "",
+    memory?.enabled
+      ? "The backend may include a per-chat memory block as the first user message. Treat that memory as durable context for this conversation, but prefer newer explicit user instructions when they conflict."
+      : ""
   ].join("\n\n");
 }
 
@@ -153,17 +162,21 @@ async function* parseOpenAiSse(body) {
   }
 }
 
-async function* streamDemoResponse({ model, files, memory, messages, signal }) {
+async function* streamDemoResponse({ model, files, memory, messages, persona, signal }) {
   const attachmentNote = files.length
     ? ` I can also see ${files.length} attached file${files.length === 1 ? "" : "s"} in this local build.`
     : "";
   const memoryNote = memory?.summary
     ? ` Per-chat memory is active; I remember that ${memory.summary.slice(0, 180)}`
     : "";
+  const personaNote = persona
+    ? ` I am responding from the ${persona.name} council seat.`
+    : "";
   const lastUser = [...messages].reverse().find((message) => message.role === "user" && !message.id?.startsWith("memory-"));
   const text = [
     `Demo mode is active because OPENAI_API_KEY is not set.`,
     ` The selected model is ${model}.`,
+    personaNote,
     attachmentNote,
     memoryNote,
     lastUser ? ` Your latest message was: "${lastUser.content.slice(0, 120)}".` : "",

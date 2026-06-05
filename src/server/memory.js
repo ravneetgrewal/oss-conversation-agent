@@ -1,5 +1,6 @@
 const DEFAULT_MEMORY_THRESHOLD = Number(process.env.MEMORY_TOKEN_THRESHOLD || 1400);
 const RECENT_MESSAGE_LIMIT = Number(process.env.MEMORY_RECENT_MESSAGES || 10);
+const CHAIRMAN_PERSONA_ID = "chairman";
 
 export function createEmptyMemory(conversationId) {
   const now = new Date().toISOString();
@@ -11,6 +12,7 @@ export function createEmptyMemory(conversationId) {
     decisions: [],
     openQuestions: [],
     topics: [],
+    personaSummaries: {},
     messageCount: 0,
     estimatedTokens: 0,
     summarizedMessages: 0,
@@ -32,6 +34,7 @@ export function buildMemorySnapshot(conversationId, messages, currentMemory = nu
   const completedMessages = messages.filter(isCompletedContentMessage);
   const userMessages = completedMessages.filter((message) => message.role === "user");
   const assistantMessages = completedMessages.filter((message) => message.role === "assistant");
+  const sharedAssistantMessages = assistantMessages.filter(isSharedAssistantMessage);
   const now = new Date().toISOString();
   const facts = mergeUnique([
     ...(currentMemory?.facts || []),
@@ -39,11 +42,12 @@ export function buildMemorySnapshot(conversationId, messages, currentMemory = nu
   ], 14);
   const decisions = mergeUnique([
     ...(currentMemory?.decisions || []),
-    ...extractDecisions(completedMessages)
+    ...extractDecisions([...userMessages, ...sharedAssistantMessages])
   ], 10);
   const openQuestions = mergeUnique(extractOpenQuestions(userMessages), 8);
   const topics = mergeUnique(extractTopics(userMessages), 10);
-  const summary = createSummary({ userMessages, assistantMessages, topics, decisions, currentSummary: currentMemory?.summary || "" });
+  const summary = createSummary({ userMessages, topics, decisions, currentSummary: currentMemory?.summary || "" });
+  const personaSummaries = buildPersonaSummaries(assistantMessages, currentMemory?.personaSummaries || {});
 
   return {
     ...createEmptyMemory(conversationId),
@@ -53,6 +57,7 @@ export function buildMemorySnapshot(conversationId, messages, currentMemory = nu
     decisions,
     openQuestions,
     topics,
+    personaSummaries,
     messageCount: completedMessages.length,
     estimatedTokens: estimateConversationTokens(completedMessages),
     summarizedMessages: Math.max(0, completedMessages.length - RECENT_MESSAGE_LIMIT),
@@ -61,13 +66,15 @@ export function buildMemorySnapshot(conversationId, messages, currentMemory = nu
   };
 }
 
-export function prepareMessagesForModel(messages, memory) {
-  const completedMessages = messages.filter(isCompletedContentMessage);
-  if (!memory?.enabled || !hasMemoryContent(memory)) return completedMessages;
+export function prepareMessagesForModel(messages, memory, { personaId = null } = {}) {
+  const completedMessages = messages
+    .filter(isCompletedContentMessage)
+    .filter((message) => shouldIncludeForPersona(message, personaId));
+  if (!memory?.enabled || !hasMemoryContent(memory, personaId)) return completedMessages;
 
   const recentMessages = completedMessages.slice(-RECENT_MESSAGE_LIMIT);
   const olderMessagesWereSummarized = completedMessages.length > recentMessages.length;
-  const memoryText = renderMemoryForPrompt(memory, olderMessagesWereSummarized);
+  const memoryText = renderMemoryForPrompt(memory, olderMessagesWereSummarized, personaId);
   return [
     {
       id: `memory-${memory.conversationId}`,
@@ -76,6 +83,7 @@ export function prepareMessagesForModel(messages, memory) {
       content: memoryText,
       status: "completed",
       files: [],
+      personaId,
       createdAt: memory.updatedAt,
       updatedAt: memory.updatedAt
     },
@@ -83,7 +91,8 @@ export function prepareMessagesForModel(messages, memory) {
   ];
 }
 
-export function renderMemoryForPrompt(memory, olderMessagesWereSummarized = true) {
+export function renderMemoryForPrompt(memory, olderMessagesWereSummarized = true, personaId = null) {
+  const personaSummary = personaId ? memory.personaSummaries?.[personaId] : "";
   const sections = [
     "Per-chat memory for this conversation.",
     olderMessagesWereSummarized
@@ -93,28 +102,43 @@ export function renderMemoryForPrompt(memory, olderMessagesWereSummarized = true
     memory.facts?.length ? `User facts and preferences:\n${memory.facts.map((item) => `- ${item}`).join("\n")}` : "",
     memory.decisions?.length ? `Decisions and requirements:\n${memory.decisions.map((item) => `- ${item}`).join("\n")}` : "",
     memory.openQuestions?.length ? `Open questions:\n${memory.openQuestions.map((item) => `- ${item}`).join("\n")}` : "",
-    memory.topics?.length ? `Topics:\n${memory.topics.map((item) => `- ${item}`).join("\n")}` : ""
+    memory.topics?.length ? `Topics:\n${memory.topics.map((item) => `- ${item}`).join("\n")}` : "",
+    personaSummary ? `Memory for this persona only:\n${personaSummary}` : ""
   ].filter(Boolean);
   return sections.join("\n\n");
 }
 
-function createSummary({ userMessages, assistantMessages, topics, decisions, currentSummary }) {
+function createSummary({ userMessages, topics, decisions, currentSummary }) {
   const latestUserGoals = userMessages
     .map((message) => cleanSentence(message.content))
     .filter(Boolean)
     .slice(-5);
-  const latestAssistantWork = assistantMessages
-    .map((message) => cleanSentence(message.content))
-    .filter(Boolean)
-    .slice(-3);
 
   const parts = [];
   if (topics.length) parts.push(`The chat has focused on ${topics.slice(0, 5).join(", ")}.`);
   if (latestUserGoals.length) parts.push(`Recent user goals: ${latestUserGoals.join(" ")}`);
   if (decisions.length) parts.push(`Notable decisions: ${decisions.slice(0, 4).join(" ")}`);
-  if (latestAssistantWork.length) parts.push(`Recent assistant work: ${latestAssistantWork.join(" ")}`);
   if (!parts.length && currentSummary) return currentSummary;
   return parts.join(" ").slice(0, 1800);
+}
+
+function buildPersonaSummaries(assistantMessages, currentSummaries = {}) {
+  const summaries = { ...currentSummaries };
+  const grouped = new Map();
+  for (const message of assistantMessages) {
+    if (!message.personaId || message.personaId === CHAIRMAN_PERSONA_ID) continue;
+    if (!grouped.has(message.personaId)) grouped.set(message.personaId, []);
+    grouped.get(message.personaId).push(message);
+  }
+
+  for (const [personaId, messages] of grouped) {
+    const latest = messages
+      .map((message) => cleanSentence(message.content))
+      .filter(Boolean)
+      .slice(-3);
+    if (latest.length) summaries[personaId] = latest.join(" ").slice(0, 900);
+  }
+  return summaries;
 }
 
 function extractFacts(userMessages) {
@@ -192,14 +216,24 @@ function isCompletedContentMessage(message) {
   return ["user", "assistant"].includes(message.role) && message.status !== "failed" && message.status !== "cancelled" && Boolean(message.content?.trim());
 }
 
-function hasMemoryContent(memory) {
+function hasMemoryContent(memory, personaId = null) {
   return Boolean(
     memory.summary ||
     memory.facts?.length ||
     memory.decisions?.length ||
     memory.openQuestions?.length ||
-    memory.topics?.length
+    memory.topics?.length ||
+    (personaId && memory.personaSummaries?.[personaId])
   );
+}
+
+function shouldIncludeForPersona(message, personaId) {
+  if (message.role !== "assistant" || !personaId) return true;
+  return !message.personaId || message.personaId === CHAIRMAN_PERSONA_ID || message.personaId === personaId;
+}
+
+function isSharedAssistantMessage(message) {
+  return !message.personaId || message.personaId === CHAIRMAN_PERSONA_ID;
 }
 
 function splitSentences(text) {

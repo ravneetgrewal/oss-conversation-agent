@@ -96,7 +96,9 @@ export async function addMessage({
   status = "completed",
   files = [],
   turnId = null,
-  candidateIndex = null
+  candidateIndex = null,
+  personaId = null,
+  personaName = null
 }) {
   await loadStore();
   const now = new Date().toISOString();
@@ -110,6 +112,8 @@ export async function addMessage({
     files,
     turnId,
     candidateIndex,
+    personaId,
+    personaName,
     providerResponseId: null,
     usage: null,
     error: null,

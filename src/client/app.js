@@ -1,3 +1,8 @@
+const CHAIRMAN_PERSONA_ID = "chairman";
+const CHAIRMAN_PERSONA_NAME = "Chairman Brief";
+const BRIEFING_PERSONA_ID = "briefing_partner";
+const BRIEFING_PERSONA_NAME = "Briefing Partner";
+
 const state = {
   conversations: [],
   activeConversation: null,
@@ -7,11 +12,19 @@ const state = {
   models: [],
   modelCatalog: null,
   defaultModel: "",
+  personas: [],
+  councilPacks: [],
+  councilPackId: "",
   pendingFiles: [],
   abortController: null,
   isStreaming: false,
   compareMode: false,
   compareModel: "",
+  councilPanelOpen: false,
+  councilViewMode: "columns",
+  councilActivePersonaId: CHAIRMAN_PERSONA_ID,
+  councilSeatCount: 3,
+  councilSeats: [],
   activeStream: null
 };
 
@@ -29,6 +42,8 @@ const els = {
   modelPickerMenu: document.querySelector("#model-picker-menu"),
   refreshModels: document.querySelector("#refresh-models"),
   compareToggle: document.querySelector("#compare-toggle"),
+  councilViewToggle: document.querySelector("#council-view-toggle"),
+  councilPanel: document.querySelector("#council-panel"),
   compareModel: document.querySelector("#compare-model-select"),
   compareModelPicker: document.querySelector("#compare-model-picker"),
   compareModelPickerButton: document.querySelector("#compare-model-picker-button"),
@@ -66,6 +81,10 @@ async function bootstrap() {
   state.models = data.models;
   state.modelCatalog = data.modelCatalog || null;
   state.defaultModel = data.defaultModel;
+  state.personas = data.personas || [];
+  state.councilPacks = data.councilPacks || [];
+  state.councilPackId = state.councilPacks[0]?.id || "";
+  state.councilSeats = createDefaultCouncilSeats();
   els.connection.textContent = [
     data.hasOpenAiKey ? "OpenAI" : "",
     data.hasOpenRouterKey ? "OpenRouter" : ""
@@ -87,10 +106,14 @@ function bindEvents() {
   els.model.addEventListener("change", updateModel);
   els.modelPickerButton.addEventListener("click", toggleModelPicker);
   els.compareToggle.addEventListener("click", toggleCompareMode);
+  els.councilViewToggle.addEventListener("click", handleCouncilViewToggle);
+  els.councilPanel.addEventListener("change", handleCouncilPanelChange);
+  els.councilPanel.addEventListener("click", handleCouncilPanelClick);
   els.compareModel.addEventListener("change", updateCompareModel);
   els.compareModelPickerButton.addEventListener("click", toggleCompareModelPicker);
   document.addEventListener("click", closeModelPickerOnOutsideClick);
   document.addEventListener("keydown", closeModelPickerOnEscape);
+  window.addEventListener("resize", positionCouncilPanel);
   els.memoryToggle.addEventListener("click", openMemoryPanel);
   els.memoryClose.addEventListener("click", closeMemoryPanel);
   els.memorySave.addEventListener("click", saveMemory);
@@ -98,7 +121,7 @@ function bindEvents() {
   els.title.addEventListener("change", updateTitle);
   els.deleteChat.addEventListener("click", archiveConversation);
   els.composer.addEventListener("submit", sendMessage);
-  els.messages.addEventListener("click", handleMessageActionClick);
+  els.messages.addEventListener("click", handleMessagesClick);
   els.stop.addEventListener("click", stopStreaming);
   els.attach.addEventListener("click", () => els.fileInput.click());
   els.fileInput.addEventListener("change", uploadFiles);
@@ -134,6 +157,9 @@ async function loadConversation(id) {
   if (!state.compareModel || state.compareModel === els.model.value) {
     setCompareModelValue(getFallbackCompareModel(els.model.value));
   }
+  syncCouncilSeatModelsToPrimary();
+  syncCouncilSeatDefaults();
+  renderCouncilPanel();
   renderConversations();
   renderMessages();
   renderMemoryPanel();
@@ -146,6 +172,9 @@ async function updateModel() {
   state.activeConversation.model = els.model.value;
   syncModelPicker();
   if (els.compareModel.value === els.model.value) setCompareModelValue(getFallbackCompareModel(els.model.value));
+  syncCouncilSeatModelsToPrimary();
+  syncCouncilSeatDefaults();
+  renderCouncilPanel();
   await api(`/api/conversations/${state.activeConversation.id}`, {
     method: "PATCH",
     body: { model: els.model.value }
@@ -173,6 +202,8 @@ async function refreshModels() {
       primary: normalizeModelValue(currentModel),
       compare: normalizeModelValue(currentCompareModel)
     });
+    syncCouncilSeatDefaults();
+    renderCouncilPanel();
     const errors = state.modelCatalog?.errors || [];
     els.connection.textContent = errors.length ? `Models refreshed with ${errors.length} warning${errors.length === 1 ? "" : "s"}` : "Models refreshed";
   } catch (error) {
@@ -213,7 +244,7 @@ async function sendMessage(event) {
   const content = els.input.value.trim();
   const fileIds = state.pendingFiles.map((file) => file.id);
   if (!content && fileIds.length === 0) return;
-  const selectedModels = getSelectedModels();
+  const selectedSeats = getSelectedSeats();
   const turnId = `local-turn-${Date.now()}`;
 
   const userMessage = {
@@ -225,19 +256,7 @@ async function sendMessage(event) {
     turnId,
     createdAt: new Date().toISOString()
   };
-  const assistantMessages = selectedModels.map((model, index) => ({
-    id: `local-assistant-${Date.now()}-${index}`,
-    role: "assistant",
-    content: "",
-    error: null,
-    files: [],
-    model,
-    status: "streaming",
-    turnId,
-    candidateIndex: index,
-    createdAt: new Date().toISOString()
-  }));
-
+  const assistantMessages = createLocalCouncilMessages(selectedSeats, turnId);
   state.messages.push(userMessage, ...assistantMessages);
   els.input.value = "";
   state.pendingFiles = [];
@@ -248,14 +267,14 @@ async function sendMessage(event) {
 
   state.abortController = new AbortController();
   state.activeStream = {
-    expectedAssistantCount: selectedModels.length,
+    expectedAssistantCount: assistantMessages.length,
     compareUnsupported: false
   };
   try {
     await consumeSse(`/api/conversations/${state.activeConversation.id}/messages`, {
       content,
       model: els.model.value,
-      models: selectedModels,
+      seats: selectedSeats,
       fileIds
     }, state.abortController.signal);
     if (!state.activeStream?.compareUnsupported) {
@@ -277,43 +296,73 @@ async function sendMessage(event) {
   }
 }
 
-async function regenerateLast() {
-  if (state.isStreaming || !state.activeConversation) return;
-  const lastUserIndex = findLastIndex(state.messages, (message) => message.role === "user");
-  if (lastUserIndex === -1) return;
-  const previousCandidates = state.messages.slice(lastUserIndex + 1).filter((message) => message.role === "assistant");
-  const selectedModels = state.compareMode
-    ? getSelectedModels()
-    : previousCandidates.length > 1
-      ? uniqueModels(previousCandidates.map((message) => message.model)).slice(0, 2)
-      : [els.model.value];
-  const turnId = state.messages[lastUserIndex].turnId || `local-turn-${Date.now()}`;
-
-  state.messages = state.messages.slice(0, lastUserIndex + 1);
-  state.messages.push(...selectedModels.map((model, index) => ({
+function createLocalCouncilMessages(selectedSeats, turnId) {
+  const messages = [];
+  if (shouldUseChairman(selectedSeats)) {
+    messages.push({
+      id: `local-assistant-${Date.now()}-chairman`,
+      role: "assistant",
+      content: "",
+      error: null,
+      files: [],
+      model: selectedSeats[0].model,
+      personaId: CHAIRMAN_PERSONA_ID,
+      personaName: CHAIRMAN_PERSONA_NAME,
+      status: "streaming",
+      turnId,
+      candidateIndex: -1,
+      createdAt: new Date().toISOString()
+    });
+  }
+  messages.push(...selectedSeats.map((seat, index) => ({
     id: `local-assistant-${Date.now()}-${index}`,
     role: "assistant",
     content: "",
     error: null,
     files: [],
-    model,
+    model: seat.model,
+    personaId: seat.personaId,
+    personaName: getPersonaName(seat.personaId),
     status: "streaming",
     turnId,
     candidateIndex: index,
     createdAt: new Date().toISOString()
   })));
+  return messages;
+}
+
+function shouldUseChairman(selectedSeats) {
+  return selectedSeats.length > 1 && selectedSeats.some((seat) => seat.personaId);
+}
+
+async function regenerateLast() {
+  if (state.isStreaming || !state.activeConversation) return;
+  const lastUserIndex = findLastIndex(state.messages, (message) => message.role === "user");
+  if (lastUserIndex === -1) return;
+  const previousCandidates = state.messages.slice(lastUserIndex + 1).filter((message) => message.role === "assistant");
+  const previousExpertCandidates = previousCandidates.filter((message) => !isChairmanMessage(message));
+  const selectedSeats = state.compareMode
+    ? getSelectedSeats()
+    : previousExpertCandidates.length > 1
+      ? previousExpertCandidates.map(messageToSeat).slice(0, 3)
+      : [{ model: els.model.value, personaId: previousExpertCandidates[0]?.personaId || null }];
+  const turnId = state.messages[lastUserIndex].turnId || `local-turn-${Date.now()}`;
+
+  state.messages = state.messages.slice(0, lastUserIndex + 1);
+  const assistantMessages = createLocalCouncilMessages(selectedSeats, turnId);
+  state.messages.push(...assistantMessages);
   renderMessages();
   setStreaming(true);
 
   state.abortController = new AbortController();
   state.activeStream = {
-    expectedAssistantCount: selectedModels.length,
+    expectedAssistantCount: assistantMessages.length,
     compareUnsupported: false
   };
   try {
     await consumeSse(`/api/conversations/${state.activeConversation.id}/regenerate`, {
       model: els.model.value,
-      models: selectedModels
+      seats: selectedSeats
     }, state.abortController.signal);
     if (!state.activeStream?.compareUnsupported) {
       await refreshActiveConversation();
@@ -371,21 +420,33 @@ function handleSseEvent(raw) {
     const serverAssistants = data.assistantMessages || (data.assistantMessage ? [data.assistantMessage] : []);
     const expectedAssistantCount = state.activeStream?.expectedAssistantCount || serverAssistants.length || 1;
     const localAssistants = state.messages.filter((message) => message.id?.startsWith("local-assistant")).slice(-expectedAssistantCount);
+    const matchedLocalAssistants = new Set();
+    const shouldReplaceLocalPlaceholders = serverAssistants.some((assistant) => assistant.personaId === BRIEFING_PERSONA_ID);
     serverAssistants.forEach((assistant, index) => {
-      if (!localAssistants[index]) return;
-      localAssistants[index].id = assistant.id;
-      localAssistants[index].turnId = assistant.turnId;
-      localAssistants[index].candidateIndex = assistant.candidateIndex;
-      localAssistants[index].model = assistant.model;
+      const localAssistant = findLocalAssistantMatch(localAssistants, assistant, matchedLocalAssistants) || localAssistants[index];
+      if (!localAssistant) return;
+      matchedLocalAssistants.add(localAssistant);
+      localAssistant.id = assistant.id;
+      localAssistant.turnId = assistant.turnId;
+      localAssistant.candidateIndex = assistant.candidateIndex;
+      localAssistant.model = assistant.model;
+      localAssistant.personaId = assistant.personaId;
+      localAssistant.personaName = assistant.personaName;
     });
     if (expectedAssistantCount > 1 && serverAssistants.length < expectedAssistantCount) {
-      state.activeStream.compareUnsupported = true;
-      for (const assistant of localAssistants.slice(serverAssistants.length)) {
-        assistant.status = "failed";
-        assistant.error = "Compare mode needs the updated backend. Restart the server on port 4613, then send again.";
-        assistant.content = assistant.error;
+      const unmatchedLocalAssistants = localAssistants.filter((message) => !matchedLocalAssistants.has(message));
+      if (shouldReplaceLocalPlaceholders) {
+        const unmatchedIds = new Set(unmatchedLocalAssistants.map((message) => message.id));
+        state.messages = state.messages.filter((message) => !unmatchedIds.has(message.id));
+      } else {
+        state.activeStream.compareUnsupported = true;
+        for (const assistant of unmatchedLocalAssistants) {
+          assistant.status = "failed";
+          assistant.error = "Council mode needs the updated backend. Restart the server, then send again.";
+          assistant.content = assistant.error;
+        }
+        els.connection.textContent = "Restart server to enable Council";
       }
-      els.connection.textContent = "Restart server to enable Compare";
     }
   }
 
@@ -417,6 +478,12 @@ function handleSseEvent(raw) {
     state.memory = data.memory;
     renderMemoryPanel();
   }
+}
+
+function findLocalAssistantMatch(localAssistants, assistant, matched) {
+  return localAssistants.find((local) => !matched.has(local) && local.personaId === assistant.personaId && Number(local.candidateIndex) === Number(assistant.candidateIndex)) ||
+    localAssistants.find((local) => !matched.has(local) && local.personaId === assistant.personaId) ||
+    null;
 }
 
 function stopStreaming() {
@@ -489,7 +556,7 @@ async function uploadFiles() {
 }
 
 function renderModels(selection = {}) {
-  els.model.innerHTML = renderNativeModelOptions();
+  els.model.innerHTML = renderNativeModelOptions(selection.primary || state.defaultModel);
   els.compareModel.innerHTML = els.model.innerHTML;
   els.modelPickerMenu.innerHTML = renderModelOptions();
   els.compareModelPickerMenu.innerHTML = renderModelOptions();
@@ -504,23 +571,30 @@ function renderModels(selection = {}) {
   });
   setModelValue(selection.primary || state.defaultModel);
   setCompareModelValue(selection.compare || getFallbackCompareModel(els.model.value));
+  syncCouncilSeatDefaults();
+  renderCouncilPanel();
 }
 
-function renderNativeModelOptions() {
+function renderNativeModelOptions(selectedValue = "") {
   return groupModelsForPicker().map((group) => {
     if (group.provider === "openai") {
       return `
         <optgroup label="OpenAI">
-          ${group.models.map((model) => `<option value="${escapeHtml(model.key)}">${escapeHtml(model.label)}</option>`).join("")}
+          ${group.models.map((model) => renderNativeModelOption(model, selectedValue)).join("")}
         </optgroup>
       `;
     }
     return group.upstreams.map((upstream) => `
       <optgroup label="OpenRouter / ${escapeHtml(upstream.label)}">
-        ${upstream.models.map((model) => `<option value="${escapeHtml(model.key)}">${escapeHtml(model.label)}</option>`).join("")}
+        ${upstream.models.map((model) => renderNativeModelOption(model, selectedValue)).join("")}
       </optgroup>
     `).join("");
   }).join("");
+}
+
+function renderNativeModelOption(model, selectedValue = "") {
+  const selected = model.key === selectedValue ? " selected" : "";
+  return `<option value="${escapeHtml(model.key)}"${selected}>${escapeHtml(model.label)}</option>`;
 }
 
 function renderModelOptions() {
@@ -624,6 +698,232 @@ function bindModelOptionClicks(menu, onSelect) {
   });
 }
 
+function createDefaultCouncilSeats() {
+  const model = normalizeModelValue(els.model?.value || state.defaultModel);
+  const pack = getSelectedCouncilPack();
+  const personaIds = pack?.personaIds?.length ? pack.personaIds : state.personas.slice(0, 3).map((persona) => persona.id);
+  return personaIds.slice(0, 3).map((personaId) => ({
+    personaId,
+    model
+  }));
+}
+
+function syncCouncilSeatModelsToPrimary() {
+  const model = normalizeModelValue(els.model?.value || state.defaultModel);
+  const seats = state.councilSeats.length ? state.councilSeats : createDefaultCouncilSeats();
+  state.councilSeats = seats.map((seat) => ({ ...seat, model }));
+}
+
+function syncCouncilSeatDefaults() {
+  const currentModel = normalizeModelValue(els.model?.value || state.defaultModel);
+  const existing = state.councilSeats.length ? state.councilSeats : createDefaultCouncilSeats();
+  const usedPersonas = new Set();
+  state.councilSeats = existing.slice(0, 3).map((seat, index) => {
+    let personaId = state.personas.some((persona) => persona.id === seat.personaId) ? seat.personaId : state.personas[index]?.id;
+    if (usedPersonas.has(personaId)) personaId = state.personas.find((persona) => !usedPersonas.has(persona.id))?.id || personaId;
+    usedPersonas.add(personaId);
+    return {
+      personaId,
+      model: normalizeModelValue(seat.model || currentModel)
+    };
+  });
+
+  for (const persona of state.personas) {
+    if (state.councilSeats.length >= 3) break;
+    if (usedPersonas.has(persona.id)) continue;
+    state.councilSeats.push({ personaId: persona.id, model: currentModel });
+    usedPersonas.add(persona.id);
+  }
+  const maxSeats = Math.min(3, state.councilSeats.length || 3);
+  state.councilSeatCount = Math.min(maxSeats, Math.max(2, state.councilSeatCount || maxSeats));
+  ensureCouncilActivePersona();
+}
+
+function getSelectedCouncilPack() {
+  return state.councilPacks.find((pack) => pack.id === state.councilPackId) || state.councilPacks[0] || null;
+}
+
+function applyCouncilPack(packId) {
+  const pack = state.councilPacks.find((item) => item.id === packId);
+  if (!pack) return;
+  const model = normalizeModelValue(els.model?.value || state.defaultModel);
+  state.councilPackId = pack.id;
+  state.councilSeatCount = Math.min(3, Math.max(2, pack.personaIds.length));
+  state.councilSeats = pack.personaIds.slice(0, 3).map((personaId) => ({ personaId, model }));
+  state.councilActivePersonaId = CHAIRMAN_PERSONA_ID;
+  renderCouncilPanel();
+  renderMessages(false);
+}
+
+function ensureCouncilActivePersona() {
+  const activePersonaIds = state.councilSeats
+    .slice(0, state.councilSeatCount)
+    .map((seat) => seat.personaId)
+    .filter(Boolean);
+  const availableIds = [CHAIRMAN_PERSONA_ID, ...activePersonaIds];
+  if (!activePersonaIds.length) return;
+  if (!availableIds.includes(state.councilActivePersonaId)) {
+    state.councilActivePersonaId = CHAIRMAN_PERSONA_ID;
+  }
+}
+
+function renderCouncilPanel() {
+  if (!els.councilPanel) return;
+  syncCouncilSeatDefaults();
+  const activeSeats = state.councilSeats.slice(0, state.councilSeatCount);
+  els.councilPanel.innerHTML = `
+    <div class="council-panel-header">
+      <div>
+        <strong>Council seats</strong>
+        <p>${escapeHtml(getSelectedCouncilPack()?.description || "Choose the advisory lens for this run.")}</p>
+      </div>
+      <div class="council-panel-actions">
+        <label>
+          <span class="visually-hidden">Seat count</span>
+          <select id="council-seat-count" ${state.isStreaming ? "disabled" : ""}>
+            <option value="2"${state.councilSeatCount === 2 ? " selected" : ""}>2 seats</option>
+            <option value="3"${state.councilSeatCount === 3 ? " selected" : ""}>3 seats</option>
+          </select>
+        </label>
+        <button class="council-disable-button" type="button" data-action="disable-council" ${state.isStreaming ? "disabled" : ""}>Single response</button>
+      </div>
+    </div>
+    <label class="council-pack-field">
+      <span>Pack</span>
+      <select id="council-pack-select" ${state.isStreaming ? "disabled" : ""}>
+        ${renderCouncilPackOptions()}
+      </select>
+    </label>
+    ${activeSeats.map((seat, index) => `
+      <div class="council-seat">
+        <span class="council-seat-number">${index + 1}</span>
+        <label>
+          <span>Persona</span>
+          <select class="council-persona-select" data-index="${index}" ${state.isStreaming ? "disabled" : ""}>
+            ${renderPersonaOptions(seat.personaId)}
+          </select>
+        </label>
+        <label>
+          <span>Model</span>
+          <select class="council-model-select" data-index="${index}" ${state.isStreaming ? "disabled" : ""}>
+            ${renderNativeModelOptions(seat.model)}
+          </select>
+        </label>
+      </div>
+    `).join("")}
+  `;
+}
+
+function renderCouncilPackOptions() {
+  const custom = state.councilPackId ? "" : `<option value="" selected>Custom</option>`;
+  return custom + state.councilPacks.map((pack) => {
+    const selected = pack.id === state.councilPackId ? " selected" : "";
+    return `<option value="${escapeHtml(pack.id)}"${selected}>${escapeHtml(pack.name)}</option>`;
+  }).join("");
+}
+
+function renderPersonaOptions(selectedPersonaId) {
+  return state.personas.map((persona) => {
+    const selected = persona.id === selectedPersonaId ? " selected" : "";
+    return `<option value="${escapeHtml(persona.id)}"${selected}>${escapeHtml(persona.shortName || persona.name)}</option>`;
+  }).join("");
+}
+
+function handleCouncilPanelChange(event) {
+  if (state.isStreaming) return;
+  const target = event.target;
+  if (target.id === "council-seat-count") {
+    state.councilSeatCount = Math.min(3, Math.max(2, Number(target.value) || 3));
+    ensureCouncilActivePersona();
+    renderCouncilPanel();
+    return;
+  }
+
+  if (target.id === "council-pack-select") {
+    if (target.value) applyCouncilPack(target.value);
+    return;
+  }
+
+  const index = Number(target.dataset.index);
+  if (!Number.isInteger(index) || !state.councilSeats[index]) return;
+  if (target.classList.contains("council-persona-select")) {
+    state.councilPackId = "";
+    state.councilSeats[index].personaId = target.value;
+    dedupeCouncilPersonas(index);
+    ensureCouncilActivePersona();
+  } else if (target.classList.contains("council-model-select")) {
+    state.councilSeats[index].model = normalizeModelValue(target.value);
+  }
+  renderCouncilPanel();
+}
+
+function handleCouncilViewToggle(event) {
+  const button = event.target.closest("[data-council-view]");
+  if (!button) return;
+  event.stopPropagation();
+  state.councilViewMode = button.dataset.councilView === "tabs" ? "tabs" : "columns";
+  syncCouncilModeUi();
+  renderMessages(false);
+}
+
+function handleCouncilPanelClick(event) {
+  const disable = event.target.closest("[data-action='disable-council']");
+  if (!disable || state.isStreaming) return;
+  state.compareMode = false;
+  state.councilPanelOpen = false;
+  syncCouncilModeUi();
+}
+
+function dedupeCouncilPersonas(changedIndex) {
+  const used = new Set();
+  for (let index = 0; index < state.councilSeats.length; index += 1) {
+    const seat = state.councilSeats[index];
+    if (!used.has(seat.personaId)) {
+      used.add(seat.personaId);
+      continue;
+    }
+    if (index === changedIndex) {
+      const duplicateIndex = state.councilSeats.findIndex((other, otherIndex) => otherIndex !== index && other.personaId === seat.personaId);
+      const replacement = state.personas.find((persona) => !used.has(persona.id));
+      if (replacement && duplicateIndex !== -1) {
+        state.councilSeats[duplicateIndex].personaId = replacement.id;
+        used.add(replacement.id);
+      }
+      continue;
+    }
+    const replacement = state.personas.find((persona) => !used.has(persona.id));
+    if (replacement) {
+      seat.personaId = replacement.id;
+      used.add(replacement.id);
+    }
+  }
+}
+
+function getSelectedSeats() {
+  if (!state.compareMode) {
+    return [{ model: normalizeModelValue(els.model.value), personaId: null }];
+  }
+  syncCouncilSeatDefaults();
+  return state.councilSeats.slice(0, state.councilSeatCount).map((seat) => ({
+    model: normalizeModelValue(seat.model || els.model.value),
+    personaId: seat.personaId
+  }));
+}
+
+function messageToSeat(message) {
+  return {
+    model: normalizeModelValue(message.model || els.model.value),
+    personaId: message.personaId || null
+  };
+}
+
+function getPersonaName(personaId) {
+  if (personaId === BRIEFING_PERSONA_ID) return BRIEFING_PERSONA_NAME;
+  if (personaId === CHAIRMAN_PERSONA_ID) return CHAIRMAN_PERSONA_NAME;
+  const persona = state.personas.find((item) => item.id === personaId);
+  return persona?.name || "";
+}
+
 function renderConversationsLegacy() {
   const query = els.search.value.trim().toLowerCase();
   const conversations = state.conversations.filter((conversation) => conversation.title.toLowerCase().includes(query));
@@ -696,9 +996,10 @@ function groupMessagesForRender(messages) {
 }
 
 function renderSingleMessage(message) {
+  const roleLabel = message.role === "assistant" && message.personaId ? getPersonaName(message.personaId) : message.role;
   return `
     <article class="message ${escapeHtml(message.role)}">
-      <div class="message-role">${escapeHtml(message.role)}</div>
+      <div class="message-role">${escapeHtml(roleLabel)}</div>
       <div class="message-body">
         ${renderMarkdown(message.content || statusText(message))}
         ${renderMessageFailure(message)}
@@ -712,14 +1013,22 @@ function renderSingleMessage(message) {
 
 function renderCompareGroup(messages) {
   const sorted = [...messages].sort((a, b) => Number(a.candidateIndex || 0) - Number(b.candidateIndex || 0));
+  if (state.councilViewMode === "tabs") return renderCouncilTabbedGroup(sorted);
+  const { chairman, experts } = splitChairmanMessages(sorted);
   return `
-    <article class="compare-group" aria-label="Compared model responses">
-      ${sorted.map((message) => `
-        <section class="compare-pane ${escapeHtml(message.status || "")}">
+    <article class="compare-group council-columns-group columns-${experts.length}" aria-label="Council responses">
+      ${chairman ? renderCouncilPane(chairman, "council-chairman-pane") : ""}
+      ${experts.map((message) => renderCouncilPane(message)).join("")}
+    </article>
+  `;
+}
+
+function renderCouncilPane(message, extraClass = "") {
+  return `
+        <section class="compare-pane ${escapeHtml(extraClass)} ${escapeHtml(message.status || "")}">
           <div class="compare-pane-header">
-            <span>${escapeHtml(getModelLabel(message.model))}</span>
-            ${message.status === "streaming" ? "<small>Streaming</small>" : ""}
-            ${message.status === "failed" ? `<small>${message.content?.trim() ? "Stopped early" : "Failed"}</small>` : ""}
+            <span>${escapeHtml(message.personaName || getPersonaName(message.personaId) || getModelLabel(message.model))}</span>
+            <small>${escapeHtml([getModelLabel(message.model), statusBadge(message)].filter(Boolean).join(" / "))}</small>
           </div>
           <div class="message-body">
             ${renderMarkdown(message.content || statusText(message))}
@@ -728,9 +1037,75 @@ function renderCompareGroup(messages) {
             ${renderMessageUsage(message)}
           </div>
         </section>
-      `).join("")}
+  `;
+}
+
+function renderCouncilTabbedGroup(messages) {
+  const selected = getSelectedCouncilTabMessage(messages);
+  return `
+    <article class="compare-group council-tabbed-group" aria-label="Council responses">
+      <div class="council-response-tabs" role="tablist" aria-label="Council personas">
+        ${messages.map((message, index) => {
+          const key = councilTabKey(message, index);
+          const selectedTab = key === councilTabKey(selected);
+          return `
+            <button
+              class="council-response-tab${selectedTab ? " active" : ""}"
+              type="button"
+              role="tab"
+              aria-selected="${selectedTab ? "true" : "false"}"
+              data-persona-id="${escapeHtml(message.personaId || "")}"
+              data-tab-key="${escapeHtml(key)}"
+            >
+              <span>${escapeHtml(message.personaName || getPersonaName(message.personaId) || getModelLabel(message.model))}</span>
+              ${statusBadge(message) ? `<small>${escapeHtml(statusBadge(message))}</small>` : ""}
+            </button>
+          `;
+        }).join("")}
+      </div>
+      <section class="compare-pane council-tab-pane ${escapeHtml(selected.status || "")}">
+        <div class="compare-pane-header">
+          <span>${escapeHtml(selected.personaName || getPersonaName(selected.personaId) || getModelLabel(selected.model))}</span>
+          <small>${escapeHtml([getModelLabel(selected.model), statusBadge(selected)].filter(Boolean).join(" / "))}</small>
+        </div>
+        <div class="message-body">
+          ${renderMarkdown(selected.content || statusText(selected))}
+          ${renderMessageFailure(selected)}
+          ${renderMessageActions(selected)}
+          ${renderMessageUsage(selected)}
+        </div>
+      </section>
     </article>
   `;
+}
+
+function getSelectedCouncilTabMessage(messages) {
+  return messages.find((message, index) => councilTabKey(message, index) === state.councilActivePersonaId) ||
+    messages.find((message) => message.personaId === state.councilActivePersonaId) ||
+    messages.find(isChairmanMessage) ||
+    messages[0];
+}
+
+function councilTabKey(message, index = Number(message.candidateIndex || 0)) {
+  return message.personaId || `candidate-${index}`;
+}
+
+function splitChairmanMessages(messages) {
+  return {
+    chairman: messages.find(isChairmanMessage),
+    experts: messages.filter((message) => !isChairmanMessage(message))
+  };
+}
+
+function isChairmanMessage(message) {
+  return message.personaId === CHAIRMAN_PERSONA_ID;
+}
+
+function statusBadge(message) {
+  if (message.status === "streaming") return "Streaming";
+  if (message.status === "failed") return message.content?.trim() ? "Stopped early" : "Failed";
+  if (message.status === "cancelled") return "Stopped";
+  return "";
 }
 
 function renderAttachments() {
@@ -774,7 +1149,15 @@ function renderMessageUsage(message) {
   return `<div class="message-usage">${escapeHtml(usage)}</div>`;
 }
 
-async function handleMessageActionClick(event) {
+async function handleMessagesClick(event) {
+  const tab = event.target.closest(".council-response-tab");
+  if (tab) {
+    state.councilActivePersonaId = tab.dataset.personaId || tab.dataset.tabKey || "";
+    syncCouncilModeUi();
+    renderMessages(false);
+    return;
+  }
+
   const button = event.target.closest(".message-action");
   if (!button) return;
   const messageId = button.closest(".message-actions")?.dataset.messageId;
@@ -804,6 +1187,7 @@ function downloadAssistantResponse(message) {
   const body = [
     `# ${conversationTitle}`,
     "",
+    message.personaId ? `Persona: ${message.personaName || getPersonaName(message.personaId)}` : "",
     `Model: ${message.model || state.activeConversation?.model || ""}`,
     `Created: ${new Date(message.createdAt || Date.now()).toLocaleString()}`,
     "",
@@ -829,14 +1213,16 @@ function setStreaming(value) {
   els.model.disabled = value;
   els.compareToggle.disabled = value;
   els.compareModel.disabled = value;
+  renderCouncilPanel();
   updateActionState();
-  els.connection.textContent = value ? "Streaming" : "Ready";
+  els.connection.textContent = value ? (state.compareMode ? "Council streaming" : "Streaming") : "Ready";
 }
 
 function updateActionState() {
   els.regenerate.disabled = state.isStreaming || !state.messages.some((message) => message.role === "user");
   els.modelPickerButton.disabled = state.isStreaming;
   els.compareModelPickerButton.disabled = state.isStreaming;
+  syncCouncilModeUi();
   document.querySelector(".chat-shell")?.classList.toggle("empty", state.messages.length === 0);
 }
 
@@ -1222,23 +1608,51 @@ function getFallbackCompareModel(primaryModel) {
   return state.models.find((model) => model.key !== primaryModel)?.key || primaryModel || state.defaultModel;
 }
 
-function getSelectedModels() {
-  const models = state.compareMode ? [els.model.value, els.compareModel.value] : [els.model.value];
-  return uniqueModels(models.map(normalizeModelValue)).slice(0, 2);
-}
-
-function uniqueModels(models) {
-  return [...new Set(models.filter(Boolean))];
-}
-
-function toggleCompareMode() {
+function toggleCompareMode(event) {
+  event?.stopPropagation();
   if (state.isStreaming) return;
-  state.compareMode = !state.compareMode;
-  els.compareToggle.setAttribute("aria-pressed", state.compareMode ? "true" : "false");
-  els.compareToggle.classList.toggle("active", state.compareMode);
-  els.compareModelPicker.hidden = !state.compareMode;
+  if (!state.compareMode) {
+    state.compareMode = true;
+    state.councilPanelOpen = true;
+    ensureCouncilActivePersona();
+  } else {
+    state.councilPanelOpen = !state.councilPanelOpen;
+  }
+  syncCouncilModeUi();
+  renderCouncilPanel();
   closeModelPicker();
   closeCompareModelPicker();
+}
+
+function syncCouncilModeUi() {
+  els.compareToggle.setAttribute("aria-pressed", state.compareMode ? "true" : "false");
+  els.compareToggle.classList.toggle("active", state.compareMode);
+  els.compareToggle.textContent = state.compareMode ? "Council on" : "Council";
+  els.councilViewToggle.hidden = !state.compareMode;
+  els.councilViewToggle.querySelectorAll("[data-council-view]").forEach((button) => {
+    const active = button.dataset.councilView === state.councilViewMode;
+    button.classList.toggle("active", active);
+    button.setAttribute("aria-pressed", active ? "true" : "false");
+  });
+  els.councilPanel.hidden = !(state.compareMode && state.councilPanelOpen);
+  positionCouncilPanel();
+}
+
+function positionCouncilPanel() {
+  if (!els.councilPanel || els.councilPanel.hidden) return;
+  requestAnimationFrame(() => {
+    if (els.councilPanel.hidden) return;
+    const composerRect = els.composer.getBoundingClientRect();
+    const margin = 16;
+    const gap = 14;
+    const spaceAbove = Math.max(0, composerRect.top - margin - gap);
+    const spaceBelow = Math.max(0, window.innerHeight - composerRect.bottom - margin - gap);
+    const preferBelow = spaceBelow > spaceAbove;
+    const available = preferBelow ? spaceBelow : spaceAbove;
+    els.councilPanel.classList.toggle("below", preferBelow);
+    els.councilPanel.classList.toggle("above", !preferBelow);
+    els.councilPanel.style.maxHeight = `${Math.max(80, Math.min(620, Math.floor(available)))}px`;
+  });
 }
 
 function toggleModelPicker(event) {
@@ -1271,12 +1685,25 @@ function closeCompareModelPicker() {
 function closeModelPickerOnOutsideClick(event) {
   if (!els.modelPicker.contains(event.target)) closeModelPicker();
   if (!els.compareModelPicker.contains(event.target)) closeCompareModelPicker();
+  if (
+    state.compareMode &&
+    state.councilPanelOpen &&
+    !els.councilPanel.contains(event.target) &&
+    !els.compareToggle.contains(event.target)
+  ) {
+    state.councilPanelOpen = false;
+    syncCouncilModeUi();
+  }
 }
 
 function closeModelPickerOnEscape(event) {
   if (event.key === "Escape") {
     closeModelPicker();
     closeCompareModelPicker();
+    if (state.councilPanelOpen) {
+      state.councilPanelOpen = false;
+      syncCouncilModeUi();
+    }
   }
 }
 
