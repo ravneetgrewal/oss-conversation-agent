@@ -266,6 +266,10 @@ svg {
   gap: 18px;
   justify-content: space-between;
   pointer-events: none;
+  background: var(--canvas);
+  border-radius: 10px;
+  border: 1px solid lightgray;
+  padding: 10px;
 }
 
 .title-block,
@@ -887,7 +891,8 @@ svg {
   cursor: not-allowed;
 }
 
-.council-pack-field {
+.council-pack-field,
+.council-orchestrator-field {
   display: grid;
   gap: 5px;
   padding: 10px;
@@ -896,12 +901,18 @@ svg {
   background: #fff;
 }
 
-.council-pack-field span {
+.council-pack-field span,
+.council-orchestrator-field span {
   color: var(--muted);
   font-size: 10px;
   font-weight: 720;
   letter-spacing: 0.04em;
   text-transform: uppercase;
+}
+
+.council-orchestrator-field small {
+  color: var(--muted);
+  font-size: 11px;
 }
 
 .council-seat {

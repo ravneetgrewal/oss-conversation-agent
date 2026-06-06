@@ -24,6 +24,7 @@ const state = {
   councilViewMode: "columns",
   councilActivePersonaId: CHAIRMAN_PERSONA_ID,
   councilSeatCount: 3,
+  orchestratorModel: "",
   councilSeats: [],
   activeStream: null
 };
@@ -84,10 +85,12 @@ async function bootstrap() {
   state.personas = data.personas || [];
   state.councilPacks = data.councilPacks || [];
   state.councilPackId = state.councilPacks[0]?.id || "";
+  state.orchestratorModel = normalizeModelValue(data.defaultModel);
   state.councilSeats = createDefaultCouncilSeats();
   els.connection.textContent = [
     data.hasOpenAiKey ? "OpenAI" : "",
-    data.hasOpenRouterKey ? "OpenRouter" : ""
+    data.hasOpenRouterKey ? "OpenRouter" : "",
+    data.hasOllamaLocal ? "Ollama" : ""
   ].filter(Boolean).join(" + ") || "Demo mode";
   renderModels();
   renderConversations();
@@ -157,6 +160,9 @@ async function loadConversation(id) {
   if (!state.compareModel || state.compareModel === els.model.value) {
     setCompareModelValue(getFallbackCompareModel(els.model.value));
   }
+  if (!state.orchestratorModel) {
+    state.orchestratorModel = normalizeModelValue(els.model.value);
+  }
   syncCouncilSeatModelsToPrimary();
   syncCouncilSeatDefaults();
   renderCouncilPanel();
@@ -169,9 +175,13 @@ async function loadConversation(id) {
 
 async function updateModel() {
   if (!state.activeConversation) return;
+  const previousModel = state.activeConversation.model;
   state.activeConversation.model = els.model.value;
   syncModelPicker();
   if (els.compareModel.value === els.model.value) setCompareModelValue(getFallbackCompareModel(els.model.value));
+  if (!state.orchestratorModel || state.orchestratorModel === normalizeModelValue(previousModel)) {
+    state.orchestratorModel = normalizeModelValue(els.model.value);
+  }
   syncCouncilSeatModelsToPrimary();
   syncCouncilSeatDefaults();
   renderCouncilPanel();
@@ -198,6 +208,7 @@ async function refreshModels() {
     state.models = data.models;
     state.modelCatalog = data.modelCatalog || null;
     state.defaultModel = data.defaultModel;
+    state.orchestratorModel = normalizeModelValue(state.orchestratorModel || currentModel);
     renderModels({
       primary: normalizeModelValue(currentModel),
       compare: normalizeModelValue(currentCompareModel)
@@ -245,6 +256,7 @@ async function sendMessage(event) {
   const fileIds = state.pendingFiles.map((file) => file.id);
   if (!content && fileIds.length === 0) return;
   const selectedSeats = getSelectedSeats();
+  const orchestratorModel = getSelectedOrchestratorModel();
   const turnId = `local-turn-${Date.now()}`;
 
   const userMessage = {
@@ -256,7 +268,7 @@ async function sendMessage(event) {
     turnId,
     createdAt: new Date().toISOString()
   };
-  const assistantMessages = createLocalCouncilMessages(selectedSeats, turnId);
+  const assistantMessages = createLocalCouncilMessages(selectedSeats, turnId, orchestratorModel);
   state.messages.push(userMessage, ...assistantMessages);
   els.input.value = "";
   state.pendingFiles = [];
@@ -274,6 +286,7 @@ async function sendMessage(event) {
     await consumeSse(`/api/conversations/${state.activeConversation.id}/messages`, {
       content,
       model: els.model.value,
+      orchestratorModel,
       seats: selectedSeats,
       fileIds
     }, state.abortController.signal);
@@ -296,7 +309,7 @@ async function sendMessage(event) {
   }
 }
 
-function createLocalCouncilMessages(selectedSeats, turnId) {
+function createLocalCouncilMessages(selectedSeats, turnId, orchestratorModel = getSelectedOrchestratorModel()) {
   const messages = [];
   if (shouldUseChairman(selectedSeats)) {
     messages.push({
@@ -305,7 +318,7 @@ function createLocalCouncilMessages(selectedSeats, turnId) {
       content: "",
       error: null,
       files: [],
-      model: selectedSeats[0].model,
+      model: orchestratorModel,
       personaId: CHAIRMAN_PERSONA_ID,
       personaName: CHAIRMAN_PERSONA_NAME,
       status: "streaming",
@@ -346,10 +359,14 @@ async function regenerateLast() {
     : previousExpertCandidates.length > 1
       ? previousExpertCandidates.map(messageToSeat).slice(0, 3)
       : [{ model: els.model.value, personaId: previousExpertCandidates[0]?.personaId || null }];
+  const previousChairman = previousCandidates.find(isChairmanMessage);
+  const orchestratorModel = state.compareMode
+    ? getSelectedOrchestratorModel()
+    : normalizeModelValue(previousChairman?.model || els.model.value);
   const turnId = state.messages[lastUserIndex].turnId || `local-turn-${Date.now()}`;
 
   state.messages = state.messages.slice(0, lastUserIndex + 1);
-  const assistantMessages = createLocalCouncilMessages(selectedSeats, turnId);
+  const assistantMessages = createLocalCouncilMessages(selectedSeats, turnId, orchestratorModel);
   state.messages.push(...assistantMessages);
   renderMessages();
   setStreaming(true);
@@ -362,6 +379,7 @@ async function regenerateLast() {
   try {
     await consumeSse(`/api/conversations/${state.activeConversation.id}/regenerate`, {
       model: els.model.value,
+      orchestratorModel,
       seats: selectedSeats
     }, state.abortController.signal);
     if (!state.activeStream?.compareUnsupported) {
@@ -577,9 +595,9 @@ function renderModels(selection = {}) {
 
 function renderNativeModelOptions(selectedValue = "") {
   return groupModelsForPicker().map((group) => {
-    if (group.provider === "openai") {
+    if (group.kind === "direct") {
       return `
-        <optgroup label="OpenAI">
+        <optgroup label="${escapeHtml(group.label)}">
           ${group.models.map((model) => renderNativeModelOption(model, selectedValue)).join("")}
         </optgroup>
       `;
@@ -599,10 +617,10 @@ function renderNativeModelOption(model, selectedValue = "") {
 
 function renderModelOptions() {
   return groupModelsForPicker().map((group) => {
-    if (group.provider === "openai") {
+    if (group.kind === "direct") {
       return `
         <div class="model-option-group" role="presentation">
-          <div class="model-option-heading">OpenAI</div>
+          <div class="model-option-heading">${escapeHtml(group.label)}</div>
           ${group.models.map(renderModelOption).join("")}
         </div>
       `;
@@ -631,7 +649,7 @@ function renderModelOption(model) {
 }
 
 function groupModelsForPicker() {
-  const openAiModels = [];
+  const directGroups = new Map();
   const openRouterGroups = new Map();
   for (const model of state.models.filter((item) => item.recommended !== false)) {
     if (model.provider === "openrouter") {
@@ -645,13 +663,22 @@ function groupModelsForPicker() {
       }
       openRouterGroups.get(upstream).models.push(model);
     } else {
-      openAiModels.push(model);
+      const provider = model.provider || "other";
+      if (!directGroups.has(provider)) {
+        directGroups.set(provider, {
+          kind: "direct",
+          provider,
+          label: providerDisplayLabel(provider),
+          models: []
+        });
+      }
+      directGroups.get(provider).models.push(model);
     }
   }
   const result = [];
-  if (openAiModels.length) {
-    result.push({ provider: "openai", models: openAiModels.sort(comparePickerModels) });
-  }
+  result.push(...[...directGroups.values()]
+    .sort((a, b) => providerGroupRank(a.provider) - providerGroupRank(b.provider) || a.label.localeCompare(b.label))
+    .map((group) => ({ ...group, models: group.models.sort(comparePickerModels) })));
   if (openRouterGroups.size) {
     result.push({
       provider: "openrouter",
@@ -670,6 +697,20 @@ function comparePickerModels(a, b) {
 
 function extractOpenRouterUpstream(id) {
   return String(id || "").split("/")[0] || "other";
+}
+
+function providerDisplayLabel(provider) {
+  const labels = {
+    openai: "OpenAI",
+    ollama: "Ollama"
+  };
+  return labels[provider] || provider.replace(/[-_]/g, " ").replace(/\b\w/g, (letter) => letter.toUpperCase());
+}
+
+function providerGroupRank(provider) {
+  const order = ["openai", "ollama"];
+  const index = order.indexOf(provider);
+  return index === -1 ? 50 : index;
 }
 
 function upstreamRank(upstream) {
@@ -794,6 +835,13 @@ function renderCouncilPanel() {
         ${renderCouncilPackOptions()}
       </select>
     </label>
+    <label class="council-orchestrator-field">
+      <span>Orchestrator</span>
+      <select id="council-orchestrator-model" ${state.isStreaming ? "disabled" : ""}>
+        ${renderNativeModelOptions(getSelectedOrchestratorModel())}
+      </select>
+      <small>Used for Briefing Partner and Chairman Brief</small>
+    </label>
     ${activeSeats.map((seat, index) => `
       <div class="council-seat">
         <span class="council-seat-number">${index + 1}</span>
@@ -841,6 +889,12 @@ function handleCouncilPanelChange(event) {
 
   if (target.id === "council-pack-select") {
     if (target.value) applyCouncilPack(target.value);
+    return;
+  }
+
+  if (target.id === "council-orchestrator-model") {
+    state.orchestratorModel = normalizeModelValue(target.value);
+    renderCouncilPanel();
     return;
   }
 
@@ -908,6 +962,11 @@ function getSelectedSeats() {
     model: normalizeModelValue(seat.model || els.model.value),
     personaId: seat.personaId
   }));
+}
+
+function getSelectedOrchestratorModel() {
+  state.orchestratorModel = normalizeModelValue(state.orchestratorModel || els.model?.value || state.defaultModel);
+  return state.orchestratorModel;
 }
 
 function messageToSeat(message) {

@@ -113,6 +113,12 @@ export async function refreshModelCatalog() {
     errors.push(`OpenRouter: ${error.message}`);
   }
 
+  try {
+    discovered.push(...await fetchOllamaModels());
+  } catch (error) {
+    errors.push(`Ollama: ${error.message}`);
+  }
+
   const nextModels = buildDisplayCatalog(discovered);
   models.splice(0, models.length, ...nextModels);
   modelCatalog = {
@@ -127,6 +133,10 @@ export async function* streamAssistantResponse({ model, messages, files = [], me
   const selected = resolveModel(model) || resolveModel(getDefaultModel());
   if (selected.provider === "openrouter") {
     yield* streamOpenRouterResponse({ model: selected.id, label: selected.label, messages, files, memory, persona, signal });
+    return;
+  }
+  if (selected.provider === "ollama") {
+    yield* streamOllamaResponse({ model: selected.id, label: selected.label, messages, files, memory, persona, signal });
     return;
   }
   yield* streamOpenAiResponse({ model: selected.id, messages, files, memory, persona, signal });
@@ -212,16 +222,51 @@ function normalizeOpenRouterModel(record) {
   };
 }
 
+async function fetchOllamaModels() {
+  const response = await fetch(`${getOllamaBaseUrl()}/api/tags`);
+  if (!response.ok) throw new Error(`models endpoint returned HTTP ${response.status}`);
+  const payload = await response.json();
+  const records = Array.isArray(payload.models) ? payload.models : [];
+  return records.map(normalizeOllamaModel).filter(Boolean);
+}
+
+function getOllamaBaseUrl() {
+  return (process.env.OLLAMA_BASE_URL || "http://127.0.0.1:11434").replace(/\/$/, "");
+}
+
+function normalizeOllamaModel(record) {
+  const id = String(record?.model || record?.name || "");
+  if (!id) return null;
+  const capabilities = Array.isArray(record.capabilities) ? record.capabilities : [];
+  return {
+    key: `ollama:${id}`,
+    id,
+    provider: "ollama",
+    upstreamProvider: "ollama",
+    upstreamProviderLabel: "Ollama",
+    label: `Ollama ${formatModelLabel(id)}`,
+    description: `Local Ollama model${record.details?.parameter_size ? `, ${record.details.parameter_size}` : ""}`,
+    supportsFiles: false,
+    supportsImages: false,
+    supportsReasoning: capabilities.includes("thinking") || /reason|think/i.test(id),
+    recommended: true,
+    source: "discovered",
+    created: record.modified_at ? Date.parse(record.modified_at) / 1000 : null,
+    size: record.size ?? null
+  };
+}
+
 function buildDisplayCatalog(discovered) {
   const openAiLive = discovered.filter((model) => model.provider === "openai");
   const openRouterLive = discovered.filter((model) => model.provider === "openrouter");
+  const ollamaLive = discovered.filter((model) => model.provider === "ollama");
   const openAiModelsForDisplay = (openAiLive.length ? openAiLive : fallbackModels.filter((model) => model.provider === "openai"))
     .sort(compareModelFreshness)
     .slice(0, OPENAI_DIRECT_MODEL_LIMIT);
   const openRouterModelsForDisplay = selectOpenRouterDisplayModels(
     openRouterLive.length ? openRouterLive : fallbackModels.filter((model) => model.provider === "openrouter")
   );
-  return [...openAiModelsForDisplay, ...openRouterModelsForDisplay];
+  return [...openAiModelsForDisplay, ...openRouterModelsForDisplay, ...ollamaLive.sort(compareModelFreshness)];
 }
 
 function selectOpenRouterDisplayModels(source) {
@@ -361,6 +406,92 @@ function formatModelLabel(id) {
     .replace(/\bGpt\b/g, "GPT")
     .replace(/\bO(\d)\b/g, "o$1")
     .replace(/\bAi\b/g, "AI");
+}
+
+async function* streamOllamaResponse({ model, label, messages, files = [], memory = null, persona = null, signal }) {
+  const response = await fetch(`${getOllamaBaseUrl()}/api/chat`, {
+    method: "POST",
+    signal,
+    headers: {
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify({
+      model,
+      messages: toOllamaMessages(messages, files, memory, persona),
+      stream: true,
+      options: {
+        temperature: getModelTemperature(),
+        top_p: 1
+      }
+    })
+  });
+
+  if (!response.ok) {
+    const body = await response.text();
+    throw new Error(`${label || model} could not complete this request through Ollama. HTTP ${response.status}: ${body.slice(0, 700)}`);
+  }
+
+  yield* parseOllamaStream(response.body, model);
+}
+
+function toOllamaMessages(messages, files, memory, persona) {
+  const system = [
+    process.env.DEFAULT_SYSTEM_PROMPT || "You are a concise, useful conversational agent.",
+    persona?.prompt || "",
+    memory?.enabled
+      ? "The backend may include a per-chat memory block as the first user message. Treat that memory as durable context for this conversation, but prefer newer explicit user instructions when they conflict."
+      : ""
+  ].filter(Boolean).join("\n\n");
+
+  return [
+    { role: "system", content: system },
+    ...messages.map((message, index) => {
+      let content = message.content || "";
+      if (index === messages.length - 1 && message.role === "user" && files.length) {
+        const fileText = files
+          .filter((file) => file.textPreview)
+          .map((file) => `Attached file: ${file.filename}\n\n${file.textPreview}`)
+          .join("\n\n");
+        const unsupportedFiles = files.filter((file) => !file.textPreview);
+        const unsupportedNote = unsupportedFiles.length
+          ? `\n\nNote: ${unsupportedFiles.length} attachment${unsupportedFiles.length === 1 ? "" : "s"} could not be sent to this local Ollama text-only path.`
+          : "";
+        content = [fileText, content, unsupportedNote].filter(Boolean).join("\n\n");
+      }
+      return {
+        role: message.role === "assistant" ? "assistant" : "user",
+        content
+      };
+    })
+  ];
+}
+
+async function* parseOllamaStream(body, model) {
+  const decoder = new TextDecoder();
+  let buffer = "";
+
+  for await (const chunk of body) {
+    buffer += decoder.decode(chunk, { stream: true });
+    const lines = buffer.split(/\r?\n/);
+    buffer = lines.pop() ?? "";
+    for (const line of lines) {
+      if (!line.trim()) continue;
+      const parsed = JSON.parse(line);
+      const delta = parsed.message?.content || parsed.response || "";
+      if (delta) yield { type: "message.delta", delta };
+      if (parsed.done) {
+        yield {
+          type: "message.completed",
+          providerResponseId: `ollama:${model}`,
+          usage: {
+            input_tokens: parsed.prompt_eval_count ?? null,
+            output_tokens: parsed.eval_count ?? null,
+            total_duration: parsed.total_duration ?? null
+          }
+        };
+      }
+    }
+  }
 }
 
 async function* streamOpenRouterResponse({ model, label, messages, files = [], memory = null, persona = null, signal }) {

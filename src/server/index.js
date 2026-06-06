@@ -51,6 +51,7 @@ async function handleApi(req, res) {
       },
       hasOpenAiKey: Boolean(process.env.OPENAI_API_KEY),
       hasOpenRouterKey: Boolean(process.env.OPENROUTER_API_KEY),
+      hasOllamaLocal: catalog.models.some((model) => model.provider === "ollama"),
       personas: listPersonas(),
       councilPacks: listCouncilPacks(),
       conversations: await listConversations()
@@ -187,6 +188,7 @@ async function streamConversationMessage(req, res, conversationId) {
   const content = String(body.content || "").trim();
   const seats = resolveRequestedSeats(body, conversation);
   const model = seats[0].model;
+  const orchestratorModel = resolveOrchestratorModel(body, conversation, seats);
   const fileIds = Array.isArray(body.fileIds) ? body.fileIds : [];
   if (!content && fileIds.length === 0) return sendJson(res, 400, { error: "Message content or file is required" });
 
@@ -208,11 +210,11 @@ async function streamConversationMessage(req, res, conversationId) {
   });
   const history = await listMessages(conversationId);
   if (!pendingBriefing && shouldAskBriefing({ content, fileIds, seats, history: previousMessages })) {
-    await streamBriefingPartner({ req, res, conversationId, model, userMessage, content, files });
+    await streamBriefingPartner({ req, res, conversationId, model: orchestratorModel, userMessage, content, files });
     return;
   }
   const councilHistory = pendingBriefing ? buildBriefedCouncilHistory(history, pendingBriefing, userMessage) : history;
-  await streamAssistantsForHistory({ req, res, conversationId, seats, files, history: councilHistory, userMessage, updateMemoryAfter: true });
+  await streamAssistantsForHistory({ req, res, conversationId, seats, orchestratorModel, files, history: councilHistory, userMessage, updateMemoryAfter: true });
 }
 
 async function streamBriefingPartner({ req, res, conversationId, model, userMessage, content, files }) {
@@ -227,11 +229,14 @@ async function streamBriefingPartner({ req, res, conversationId, model, userMess
     personaId: BRIEFING_PERSONA_ID,
     personaName: briefingPersona.name
   });
-  const text = buildBriefingQuestions(content, files);
   let accumulated = "";
+  let providerResponseId = null;
+  let usage = null;
   let aborted = false;
+  const abortController = new AbortController();
   req.on("close", () => {
     aborted = true;
+    abortController.abort();
   });
 
   res.writeHead(200, {
@@ -242,25 +247,57 @@ async function streamBriefingPartner({ req, res, conversationId, model, userMess
   });
 
   writeEvent(res, "message.started", { userMessage, assistantMessages: [briefingMessage] });
-  for (const chunk of chunkText(text, 18)) {
-    if (aborted) break;
-    accumulated += chunk;
-    writeEvent(res, "message.delta", { messageId: briefingMessage.id, delta: chunk });
+  try {
+    const messages = [{ role: "user", content: buildBriefingPrompt(content, files) }];
+    for await (const event of streamAssistantResponse({ model, messages, files: [], memory: null, persona: briefingPersona, signal: abortController.signal })) {
+      if (aborted) break;
+      if (event.type === "message.delta") {
+        accumulated += event.delta;
+        writeEvent(res, event.type, { messageId: briefingMessage.id, delta: event.delta });
+      } else if (event.type === "message.completed") {
+        providerResponseId = event.providerResponseId;
+        usage = event.usage;
+      }
+    }
+  } catch (error) {
+    const fallback = buildBriefingQuestions(content, files);
+    for (const chunk of chunkText(fallback, 18)) {
+      if (aborted) break;
+      accumulated += chunk;
+      writeEvent(res, "message.delta", { messageId: briefingMessage.id, delta: chunk });
+    }
   }
 
   const status = aborted ? "cancelled" : "completed";
   await updateMessage(briefingMessage.id, {
     content: accumulated,
-    status
+    status,
+    providerResponseId,
+    usage
   });
   writeEvent(res, status === "completed" ? "message.completed" : "message.failed", {
     messageId: briefingMessage.id,
     status,
-    providerResponseId: "briefing-partner",
-    usage: null,
+    providerResponseId: providerResponseId || "briefing-partner-fallback",
+    usage,
     error: status === "cancelled" ? "Request cancelled" : undefined
   });
   res.end();
+}
+
+function buildBriefingPrompt(content, files) {
+  const attachmentNote = files.length ? "The user attached files. Ask only for critical missing facts that are unlikely to be in the files." : "";
+  return [
+    "Prepare a brief clarification prompt before an expert council runs.",
+    "Ask 3 to 5 numbered questions maximum.",
+    "Format cleanly in markdown with one short intro sentence, one numbered list, and one closing sentence.",
+    "The user can answer any subset by number, so make each question independently answerable.",
+    "If the prompt is already sufficient, ask only the one or two questions that would most improve decision quality.",
+    attachmentNote,
+    "",
+    "User prompt:",
+    content || "(No text prompt provided.)"
+  ].filter(Boolean).join("\n");
 }
 
 function shouldAskBriefing({ content, fileIds, seats, history }) {
@@ -408,6 +445,7 @@ async function regenerateConversationMessage(req, res, conversationId) {
   const trailingAssistants = messages.slice(lastUserIndex + 1).filter((message) => message.role === "assistant");
   const seats = resolveRequestedSeats(body, conversation, trailingAssistants);
   const model = seats[0].model;
+  const orchestratorModel = resolveOrchestratorModel(body, conversation, seats, trailingAssistants);
   const shouldRegenerateBriefing = trailingAssistants.some((message) => message.personaId === BRIEFING_PERSONA_ID) &&
     shouldAskBriefing({ content: lastUser.content || "", fileIds: lastUser.files || [], seats, history: messages.slice(0, lastUserIndex) });
   const pendingBriefing = findPendingBriefing(messages.slice(0, lastUserIndex));
@@ -416,15 +454,15 @@ async function regenerateConversationMessage(req, res, conversationId) {
   await updateConversation(conversationId, { model });
   const files = await getFiles(lastUser.files || []);
   if (shouldRegenerateBriefing) {
-    await streamBriefingPartner({ req, res, conversationId, model, userMessage: lastUser, content: lastUser.content || "", files });
+    await streamBriefingPartner({ req, res, conversationId, model: orchestratorModel, userMessage: lastUser, content: lastUser.content || "", files });
     return;
   }
   const history = await listMessages(conversationId);
   const regenerateHistory = pendingBriefing ? buildBriefedCouncilHistory(history, pendingBriefing, lastUser) : history;
-  await streamAssistantsForHistory({ req, res, conversationId, seats, files, history: regenerateHistory, userMessage: null, updateMemoryAfter: false });
+  await streamAssistantsForHistory({ req, res, conversationId, seats, orchestratorModel, files, history: regenerateHistory, userMessage: null, updateMemoryAfter: false });
 }
 
-async function streamAssistantsForHistory({ req, res, conversationId, seats, files, history, userMessage, updateMemoryAfter = true }) {
+async function streamAssistantsForHistory({ req, res, conversationId, seats, orchestratorModel, files, history, userMessage, updateMemoryAfter = true }) {
   const memory = await getConversationMemory(conversationId);
   const lastHistoryUserIndex = findLastIndex(history, (message) => message.role === "user");
   const turnId = userMessage?.turnId || history[lastHistoryUserIndex]?.turnId || randomUUID();
@@ -447,7 +485,7 @@ async function streamAssistantsForHistory({ req, res, conversationId, seats, fil
         conversationId,
         role: "assistant",
         content: "",
-        model: seats[0].model,
+        model: orchestratorModel || seats[0].model,
         status: "streaming",
         turnId,
         candidateIndex: -1,
@@ -649,6 +687,13 @@ function resolveRequestedSeats(body, conversation, fallbackMessages = []) {
     personaId: null,
     personaName: null
   }));
+}
+
+function resolveOrchestratorModel(body, conversation, seats = [], fallbackMessages = []) {
+  return resolveModel(body.orchestratorModel)?.key ||
+    resolveModel(fallbackMessages.find((message) => message.personaId === CHAIRMAN_PERSONA_ID)?.model)?.key ||
+    resolveModel(seats[0]?.model || conversation.model || body.model || getDefaultModel())?.key ||
+    getDefaultModel();
 }
 
 function addSeat(seats, { model, persona, personaName = null }) {
