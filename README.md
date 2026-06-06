@@ -53,6 +53,11 @@ Tabs mode reduces scroll and puts the Chairman Brief first, with each expert per
 - Dependency-free Node server and browser client.
 - Local JSON persistence for conversations, messages, files, and memory.
 
+## Models Available via OpenRouter, OpenAI, Ollama (local)
+
+![OSS Conversation Agent council tabs](<ollama.png>)
+
+
 ## Run Locally
 
 Create a local env file:
