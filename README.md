@@ -99,11 +99,20 @@ http://127.0.0.1:4613
 
 Compose mounts `./data` and `./uploads` into the container so conversations and uploaded files persist across restarts.
 
+When running with Docker, the app is configured to reach Ollama on the host machine through `http://host.docker.internal:11434`. Override `DOCKER_OLLAMA_BASE_URL` if your Ollama server runs somewhere else:
+
+```powershell
+$env:DOCKER_OLLAMA_BASE_URL="http://192.168.1.20:11434"
+docker compose up --build
+```
+
 ## Provider Notes
 
 OpenAI uses the Responses API and supports multimodal file input through the app's upload pipeline.
 
 OpenRouter uses its OpenAI-compatible chat completions endpoint. Some models may reject attachments or multimodal content. When that happens, the app surfaces a user-friendly error built from the provider's actual response.
+
+Ollama uses the local HTTP API. Outside Docker the default is `http://127.0.0.1:11434`; inside Docker Compose it is mapped to the host through `host.docker.internal`.
 
 `MODEL_TEMPERATURE` controls sampling for provider calls. The default is `0.1`, which favors repeatability for decision work while still leaving the model enough room to produce useful structure.
 
