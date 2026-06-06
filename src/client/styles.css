@@ -226,6 +226,34 @@ svg {
   background: var(--canvas);
 }
 
+.app-footer {
+  position: absolute;
+  left: 50%;
+  bottom: 7px;
+  z-index: 4;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 20px;
+  padding: 2px 8px;
+  border-radius: 999px;
+  background: var(--canvas);
+  color: #9a9a9a;
+  font-size: 12px;
+  font-weight: 450;
+  line-height: 1;
+  letter-spacing: 0;
+  transform: translateX(-50%);
+  white-space: nowrap;
+}
+
+.app-footer svg {
+  width: 14px;
+  height: 14px;
+  color: #8f8f8f;
+  stroke-width: 2;
+}
+
 .topbar {
   position: absolute;
   top: 22px;
