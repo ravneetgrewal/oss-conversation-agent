@@ -1,0 +1,22 @@
+{
+  "permissions": {
+    "allow": [
+      "Read(//c/Users/ravneet/code/cliniclaw/Products/capability-command/**)",
+      "Bash(cd \"C:\\\\Users\\\\ravneet\\\\code\\\\cliniclaw\\\\Products\\\\capability-command\" && echo \"---SRC TREE---\" && find src -type f | sort && echo \"---DOCS TREE---\" && find docs -type f | sort && echo \"---DATA TREE---\" && find data -type f | sort && echo \"---SCRIPTS---\" && find scripts -type f | sort && echo \"---REVIEW---\" && find review -type f | sort)",
+      "Read(//c/Users/ravneet/code/cliniclaw/Products/capability-command/src/core/rules/**)",
+      "Read(//c/Users/ravneet/code/cliniclaw/Products/capability-command/src/core/**)",
+      "Read(//c/Users/ravneet/code/cliniclaw/Products/capability-command/src/agents/**)",
+      "Read(//c/Users/ravneet/code/cliniclaw/Products/capability-command/src/**)",
+      "Read(//c/Users/ravneet/code/cliniclaw/Products/capability-command/src/server/**)",
+      "Read(//c/Users/ravneet/code/cliniclaw/Products/capability-command/src/client/app/pages/**)",
+      "Bash(grep -ril \"ollama\" src data docs)",
+      "Read(//c/Users/ravneet/code/cliniclaw/Products/capability-command/review/**)",
+      "Bash(cd \"C:\\\\Users\\\\ravneet\\\\code\\\\cliniclaw\\\\Products\\\\capability-command\" && grep -n -i \"ollama\\\\|local mode\\\\|on-prem\\\\|privacy\" src/client/landing.html | head -30)",
+      "Bash(sed -n '1,60p' src/core/DocumentParser.js)",
+      "Bash(cd \"C:\\\\Users\\\\ravneet\\\\code\\\\cliniclaw\\\\Products\\\\capability-command\" && echo \"---py imports---\" && grep -n \"^import\\\\|^from\" src/core/document_parser.py && echo \"---bcm.json sample---\" && head -c 1500 data/compass/bcm.json && echo && echo \"---programs.json sample---\" && head -c 1500 data/compass/programs.json && echo && echo \"---mandates.json sample---\" && head -c 1200 data/compass/mandates.json)",
+      "Bash(cd /c/Users/ravneet/code/hfire && echo \"=== package.json ===\" && cat package.json && echo \"=== engine tree ===\" && find engine -type f -not -path \"*/node_modules/*\" -not -path \"*/dist/*\" | sort)",
+      "Read(//c/Users/ravneet/code/hfire/**)",
+      "Bash(cd /c/Users/ravneet/code/hfire && echo \"=== web tree ===\" && find web -type f -not -path \"*/node_modules/*\" -not -path \"*/.next/*\" | sort)"
+    ]
+  }
+}

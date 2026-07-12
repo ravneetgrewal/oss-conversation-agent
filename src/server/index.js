@@ -7,7 +7,7 @@ import { addMessage, createConversation, deleteMessagesAfter, getConversation, g
 import { getDefaultModel, getModelCatalog, refreshModelCatalog, resolveModel, streamAssistantResponse } from "./providers.js";
 import { saveUploadedFile } from "./uploads.js";
 import { buildMemorySnapshot, createEmptyMemory, prepareMessagesForModel, shouldUpdateMemory } from "./memory.js";
-import { BRIEFING_PERSONA_ID, briefingPersona, CHAIRMAN_PERSONA_ID, chairmanPersona, listCouncilPacks, listPersonas, resolvePersona } from "./personas.js";
+import { BRIEFING_PERSONA_ID, briefingPersona, CHAIRMAN_PERSONA_ID, chairmanPersona, listCouncilPacks, listPersonas, reportSynthesisPersona, resolvePersona } from "./personas.js";
 
 await loadEnvFile();
 
@@ -70,6 +70,40 @@ async function handleApi(req, res) {
         errors: catalog.errors
       }
     });
+    return;
+  }
+
+  if (req.method === "POST" && url.pathname === "/api/council/report") {
+    const body = await readJson(req);
+    const entries = Array.isArray(body.entries) ? body.entries.filter((entry) => entry && entry.content) : [];
+    if (!entries.length) return sendJson(res, 400, { error: "No council entries provided" });
+
+    const transcript = entries
+      .map((entry) => `### ${entry.personaName || "Seat"}\n${entry.content}`)
+      .join("\n\n");
+    const messages = [{
+      role: "user",
+      content: [
+        `Topic: ${body.topic || "(not provided)"}`,
+        `Council pack: ${body.packName || "(not provided)"}`,
+        "",
+        "Full council transcript:",
+        transcript
+      ].join("\n")
+    }];
+
+    const model = body.model || getDefaultModel();
+    let accumulated = "";
+    try {
+      for await (const event of streamAssistantResponse({ model, messages, files: [], memory: null, persona: reportSynthesisPersona, signal: undefined })) {
+        if (event.type === "message.delta") accumulated += event.delta;
+      }
+      const cleaned = accumulated.trim().replace(/^```(?:json)?/i, "").replace(/```$/, "").trim();
+      const report = JSON.parse(cleaned);
+      sendJson(res, 200, { report, model });
+    } catch (error) {
+      sendJson(res, 502, { error: `Could not generate report: ${error.message}` });
+    }
     return;
   }
 
@@ -647,7 +681,7 @@ function resolveRequestedModels(body, conversation, fallbackModels = []) {
     const model = resolveModel(value)?.key;
     if (!model || selected.includes(model)) continue;
     selected.push(model);
-    if (selected.length === 3) break;
+    if (selected.length === 4) break;
   }
   return selected.length ? selected : [getDefaultModel()];
 }
@@ -663,7 +697,7 @@ function resolveRequestedSeats(body, conversation, fallbackMessages = []) {
       if (persona?.id === CHAIRMAN_PERSONA_ID) continue;
       if (!model) continue;
       addSeat(seats, { model, persona });
-      if (seats.length >= 3) break;
+      if (seats.length >= 4) break;
     }
     if (seats.length) return seats;
   }
@@ -678,7 +712,7 @@ function resolveRequestedSeats(body, conversation, fallbackMessages = []) {
       persona,
       personaName: persona?.name || message.personaName || null
     });
-    if (seats.length >= 3) break;
+    if (seats.length >= 4) break;
   }
   if (seats.length) return seats;
 

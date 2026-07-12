@@ -742,8 +742,8 @@ function bindModelOptionClicks(menu, onSelect) {
 function createDefaultCouncilSeats() {
   const model = normalizeModelValue(els.model?.value || state.defaultModel);
   const pack = getSelectedCouncilPack();
-  const personaIds = pack?.personaIds?.length ? pack.personaIds : state.personas.slice(0, 3).map((persona) => persona.id);
-  return personaIds.slice(0, 3).map((personaId) => ({
+  const personaIds = pack?.personaIds?.length ? pack.personaIds : state.personas.slice(0, 4).map((persona) => persona.id);
+  return personaIds.slice(0, 4).map((personaId) => ({
     personaId,
     model
   }));
@@ -759,7 +759,7 @@ function syncCouncilSeatDefaults() {
   const currentModel = normalizeModelValue(els.model?.value || state.defaultModel);
   const existing = state.councilSeats.length ? state.councilSeats : createDefaultCouncilSeats();
   const usedPersonas = new Set();
-  state.councilSeats = existing.slice(0, 3).map((seat, index) => {
+  state.councilSeats = existing.slice(0, 4).map((seat, index) => {
     let personaId = state.personas.some((persona) => persona.id === seat.personaId) ? seat.personaId : state.personas[index]?.id;
     if (usedPersonas.has(personaId)) personaId = state.personas.find((persona) => !usedPersonas.has(persona.id))?.id || personaId;
     usedPersonas.add(personaId);
@@ -770,12 +770,12 @@ function syncCouncilSeatDefaults() {
   });
 
   for (const persona of state.personas) {
-    if (state.councilSeats.length >= 3) break;
+    if (state.councilSeats.length >= 4) break;
     if (usedPersonas.has(persona.id)) continue;
     state.councilSeats.push({ personaId: persona.id, model: currentModel });
     usedPersonas.add(persona.id);
   }
-  const maxSeats = Math.min(3, state.councilSeats.length || 3);
+  const maxSeats = Math.min(4, state.councilSeats.length || 4);
   state.councilSeatCount = Math.min(maxSeats, Math.max(2, state.councilSeatCount || maxSeats));
   ensureCouncilActivePersona();
 }
@@ -789,8 +789,8 @@ function applyCouncilPack(packId) {
   if (!pack) return;
   const model = normalizeModelValue(els.model?.value || state.defaultModel);
   state.councilPackId = pack.id;
-  state.councilSeatCount = Math.min(3, Math.max(2, pack.personaIds.length));
-  state.councilSeats = pack.personaIds.slice(0, 3).map((personaId) => ({ personaId, model }));
+  state.councilSeatCount = Math.min(4, Math.max(2, pack.personaIds.length));
+  state.councilSeats = pack.personaIds.slice(0, 4).map((personaId) => ({ personaId, model }));
   state.councilActivePersonaId = CHAIRMAN_PERSONA_ID;
   renderCouncilPanel();
   renderMessages(false);
@@ -824,6 +824,7 @@ function renderCouncilPanel() {
           <select id="council-seat-count" ${state.isStreaming ? "disabled" : ""}>
             <option value="2"${state.councilSeatCount === 2 ? " selected" : ""}>2 seats</option>
             <option value="3"${state.councilSeatCount === 3 ? " selected" : ""}>3 seats</option>
+            <option value="4"${state.councilSeatCount === 4 ? " selected" : ""}>4 seats</option>
           </select>
         </label>
         <button class="council-disable-button" type="button" data-action="disable-council" ${state.isStreaming ? "disabled" : ""}>Single response</button>
@@ -881,7 +882,7 @@ function handleCouncilPanelChange(event) {
   if (state.isStreaming) return;
   const target = event.target;
   if (target.id === "council-seat-count") {
-    state.councilSeatCount = Math.min(3, Math.max(2, Number(target.value) || 3));
+    state.councilSeatCount = Math.min(4, Math.max(2, Number(target.value) || 3));
     ensureCouncilActivePersona();
     renderCouncilPanel();
     return;
@@ -1076,9 +1077,24 @@ function renderCompareGroup(messages) {
   const { chairman, experts } = splitChairmanMessages(sorted);
   return `
     <article class="compare-group council-columns-group columns-${experts.length}" aria-label="Council responses">
+      ${renderReportBar(sorted)}
       ${chairman ? renderCouncilPane(chairman, "council-chairman-pane") : ""}
       ${experts.map((message) => renderCouncilPane(message)).join("")}
     </article>
+  `;
+}
+
+function renderReportBar(messages) {
+  const ready = messages.length > 1 && messages.every((message) => message.status === "completed" && message.content?.trim());
+  if (!ready) return "";
+  const turnId = messages[0]?.turnId || "";
+  return `
+    <div class="council-report-bar">
+      <button class="council-report-button" type="button" data-action="download-report" data-turn-id="${escapeHtml(turnId)}">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v12"/><path d="m7 10 5 5 5-5"/><rect x="4" y="17" width="16" height="4" rx="1"/></svg>
+        Download PDF report
+      </button>
+    </div>
   `;
 }
 
@@ -1103,6 +1119,7 @@ function renderCouncilTabbedGroup(messages) {
   const selected = getSelectedCouncilTabMessage(messages);
   return `
     <article class="compare-group council-tabbed-group" aria-label="Council responses">
+      ${renderReportBar(messages)}
       <div class="council-response-tabs" role="tablist" aria-label="Council personas">
         ${messages.map((message, index) => {
           const key = councilTabKey(message, index);
@@ -1217,6 +1234,12 @@ async function handleMessagesClick(event) {
     return;
   }
 
+  const reportButton = event.target.closest(".council-report-button");
+  if (reportButton) {
+    await downloadCouncilReport(reportButton.dataset.turnId, reportButton);
+    return;
+  }
+
   const button = event.target.closest(".message-action");
   if (!button) return;
   const messageId = button.closest(".message-actions")?.dataset.messageId;
@@ -1261,6 +1284,255 @@ function downloadAssistantResponse(message) {
   link.click();
   link.remove();
   URL.revokeObjectURL(url);
+}
+
+async function downloadCouncilReport(turnId, button) {
+  if (!turnId) return;
+  const entries = state.messages.filter((message) => message.turnId === turnId && message.role === "assistant" && message.content?.trim());
+  if (!entries.length) return;
+
+  const userIndex = state.messages.findIndex((message) => message.turnId === turnId && message.role === "user");
+  const topic = userIndex >= 0 ? state.messages[userIndex].content : (state.activeConversation?.title || "Council decision");
+  const packName = resolveTurnPackName(entries);
+
+  const originalLabel = button.innerHTML;
+  button.disabled = true;
+  button.innerHTML = "Preparing report...";
+
+  try {
+    const response = await fetch("/api/council/report", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        topic,
+        packName,
+        entries: entries.map((message) => ({
+          personaName: message.personaId === CHAIRMAN_PERSONA_ID ? "Chairman Brief" : (message.personaName || getPersonaName(message.personaId)),
+          content: message.content
+        }))
+      })
+    });
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.error || "Report generation failed");
+    openOnePagerForPrint(data.report, { topic, packName, date: new Date() });
+  } catch (error) {
+    window.alert(`Could not generate the PDF report: ${error.message}`);
+  } finally {
+    button.disabled = false;
+    button.innerHTML = originalLabel;
+  }
+}
+
+function resolveTurnPackName(entries) {
+  const expertPersonaIds = entries
+    .filter((message) => message.personaId && message.personaId !== CHAIRMAN_PERSONA_ID)
+    .map((message) => message.personaId);
+  if (!expertPersonaIds.length) return "Advisory Council";
+  const matchedPack = state.councilPacks.find((pack) => {
+    if (pack.personaIds.length !== expertPersonaIds.length) return false;
+    const packSet = new Set(pack.personaIds);
+    return expertPersonaIds.every((id) => packSet.has(id));
+  });
+  if (matchedPack) return matchedPack.name;
+  return expertPersonaIds.map((id) => getPersonaName(id)).filter(Boolean).join(" + ") || "Advisory Council";
+}
+
+function openOnePagerForPrint(report, meta) {
+  const html = buildOnePagerHtml(report, meta);
+  const printWindow = window.open("", "_blank");
+  if (!printWindow) {
+    window.alert("Pop-up blocked. Allow pop-ups for this site to download the PDF report.");
+    return;
+  }
+  printWindow.document.open();
+  printWindow.document.write(html);
+  printWindow.document.close();
+  printWindow.focus();
+  printWindow.addEventListener("load", () => {
+    setTimeout(() => printWindow.print(), 200);
+  });
+}
+
+const DECISION_TONE_MAP = [
+  [/no-?go|reject|unacceptable|unsound|unlikely|not justified/i, "tone-no"],
+  [/conditional|hedge|pause|hybrid|reframe|workable/i, "tone-conditional"],
+  [/go|approve|proceed|justified|acceptable|sound|likely|build clean|modernize/i, "tone-go"]
+];
+
+function decisionTone(label) {
+  const match = DECISION_TONE_MAP.find(([pattern]) => pattern.test(String(label || "")));
+  return match ? match[1] : "tone-conditional";
+}
+
+function truncateWords(text, maxWords) {
+  const words = String(text || "").trim().split(/\s+/).filter(Boolean);
+  if (words.length <= maxWords) return words.join(" ");
+  return `${words.slice(0, maxWords).join(" ")}...`;
+}
+
+function buildOnePagerHtml(report, meta) {
+  const seats = Array.isArray(report.seats) ? report.seats : [];
+  const risks = Array.isArray(report.topRisks) ? report.topRisks : [];
+  const actions = Array.isArray(report.nextActions) ? report.nextActions : [];
+  const decision = report.decision || "Decision pending";
+  const tone = decisionTone(decision);
+  const confidence = Number.isFinite(Number(report.confidence)) ? `${Math.round(Number(report.confidence))}%` : "-";
+  const title = report.title?.trim() || truncateWords(meta.topic, 10);
+  const dateLabel = meta.date.toLocaleDateString(undefined, { year: "numeric", month: "long", day: "numeric" });
+
+  return `<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>${escapeHtml(meta.packName)} report</title>
+<style>
+  @page { size: 13.33in 7.5in landscape; margin: 0; }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0; padding: 0;
+    font-family: -apple-system, "Segoe UI", "Helvetica Neue", Arial, sans-serif;
+    background: #1c2230;
+    color: #1c2230;
+  }
+  .page {
+    width: 13.33in; height: 7.5in;
+    padding: 0.45in 0.55in;
+    background: #ffffff;
+    display: flex; flex-direction: column;
+    gap: 0.2in;
+    overflow: hidden;
+  }
+  .masthead {
+    display: flex; justify-content: space-between; align-items: flex-start;
+    border-bottom: 2px solid #1c2230; padding-bottom: 0.14in;
+  }
+  .masthead .brand {
+    font-size: 11px; letter-spacing: 0.12em; text-transform: uppercase; color: #8a93a6; font-weight: 600;
+  }
+  .masthead h1 {
+    font-size: 20px; margin: 4px 0 0; font-weight: 700; color: #1c2230; max-width: 8.5in;
+  }
+  .masthead .meta {
+    text-align: right; font-size: 11px; color: #6b7280; line-height: 1.5;
+  }
+  .verdict-row {
+    display: grid; grid-template-columns: 1.3in 1fr; gap: 0.3in; align-items: stretch;
+  }
+  .verdict-badge {
+    border-radius: 8px; padding: 0.14in; display: flex; flex-direction: column; justify-content: center; align-items: center; text-align: center;
+    color: #fff;
+  }
+  .verdict-badge.tone-go { background: #1f6b4a; }
+  .verdict-badge.tone-conditional { background: #b4802b; }
+  .verdict-badge.tone-no { background: #9a2f2f; }
+  .verdict-badge .label {
+    font-size: 13px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.02em; line-height: 1.2;
+  }
+  .verdict-badge .confidence {
+    margin-top: 6px; font-size: 10.5px; opacity: 0.9;
+  }
+  .controlling {
+    background: #f4f5f7; border-left: 4px solid #1c2230; border-radius: 0 6px 6px 0;
+    padding: 0.14in 0.2in; display: flex; flex-direction: column; justify-content: center;
+  }
+  .controlling .eyebrow {
+    font-size: 10px; letter-spacing: 0.1em; text-transform: uppercase; color: #6b7280; font-weight: 700; margin-bottom: 4px;
+  }
+  .controlling p { margin: 0; font-size: 14px; line-height: 1.4; color: #1c2230; font-weight: 500; }
+  .seats {
+    display: grid; grid-template-columns: repeat(${Math.max(seats.length, 1)}, 1fr); gap: 0.18in;
+    align-items: start;
+  }
+  .seat-card {
+    border: 1px solid #e2e4ea; border-radius: 6px; padding: 0.14in;
+    display: flex; flex-direction: column; gap: 6px;
+  }
+  .seat-card .seat-name {
+    font-size: 10px; letter-spacing: 0.08em; text-transform: uppercase; color: #6b7280; font-weight: 700;
+  }
+  .seat-card .seat-call {
+    font-size: 12.5px; font-weight: 700; color: #1c2230;
+  }
+  .seat-card .seat-point {
+    font-size: 11.5px; line-height: 1.4; color: #3a3f4b;
+  }
+  .seat-card .seat-condition {
+    margin-top: auto; padding-top: 8px; border-top: 1px dashed #e2e4ea;
+    font-size: 10.5px; line-height: 1.4; color: #3a3f4b;
+  }
+  .seat-condition-label {
+    display: block; font-size: 9px; letter-spacing: 0.08em; text-transform: uppercase; color: #9aa0ac; font-weight: 700; margin-bottom: 2px;
+  }
+  .footer-strip {
+    display: grid; grid-template-columns: 1fr 1fr; gap: 0.3in;
+    border-top: 1px solid #e2e4ea; padding-top: 0.16in;
+  }
+  .footer-col .eyebrow {
+    font-size: 10px; letter-spacing: 0.1em; text-transform: uppercase; color: #6b7280; font-weight: 700; margin-bottom: 6px;
+  }
+  .footer-col ul { margin: 0; padding-left: 16px; }
+  .footer-col li { font-size: 11.5px; line-height: 1.5; color: #1c2230; margin-bottom: 2px; }
+  .disclaimer {
+    font-size: 9px; color: #9aa0ac; text-align: center; margin-top: auto; padding-top: 0.08in;
+  }
+  @media print {
+    body { background: #fff; }
+    .page { box-shadow: none; }
+  }
+</style>
+</head>
+<body>
+  <div class="page">
+    <div class="masthead">
+      <div>
+        <div class="brand">${escapeHtml(meta.packName)} &middot; Executive Brief</div>
+        <h1>${escapeHtml(title)}</h1>
+      </div>
+      <div class="meta">${escapeHtml(dateLabel)}<br>Generated from ${seats.length} council seat${seats.length === 1 ? "" : "s"}</div>
+    </div>
+
+    <div class="verdict-row">
+      <div class="verdict-badge ${tone}">
+        <div class="label">${escapeHtml(decision)}</div>
+        <div class="confidence">${escapeHtml(confidence)} confidence</div>
+      </div>
+      <div class="controlling">
+        <div class="eyebrow">Controlling argument</div>
+        <p>${escapeHtml(report.controllingArgument || "")}</p>
+      </div>
+    </div>
+
+    <div class="seats">
+      ${seats.map((seat) => `
+        <div class="seat-card">
+          <div class="seat-name">${escapeHtml(seat.name || "")}</div>
+          <div class="seat-call">${escapeHtml(seat.call || "")}</div>
+          <div class="seat-point">${escapeHtml(seat.point || "")}</div>
+          ${seat.condition ? `
+            <div class="seat-condition">
+              <span class="seat-condition-label">Condition</span>
+              ${escapeHtml(seat.condition)}
+            </div>
+          ` : ""}
+        </div>
+      `).join("")}
+    </div>
+
+    <div class="footer-strip">
+      <div class="footer-col">
+        <div class="eyebrow">Top risks</div>
+        <ul>${risks.map((risk) => `<li>${escapeHtml(risk)}</li>`).join("")}</ul>
+      </div>
+      <div class="footer-col">
+        <div class="eyebrow">Next actions</div>
+        <ul>${actions.map((action) => `<li>${escapeHtml(action)}</li>`).join("")}</ul>
+      </div>
+    </div>
+
+    <div class="disclaimer">Generated by an AI advisory council. Informational only; verify before acting on regulated, financial, or safety-critical matters.</div>
+  </div>
+</body>
+</html>`;
 }
 
 function setStreaming(value) {
